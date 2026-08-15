@@ -42,6 +42,7 @@ public class LocalFallbackActionAuthorityTest {
                 .put("planId", "plan_1")
                 .put("patch", new JSONObject()
                     .put("title", "新标题")
+                    .put("timeConfidence", "explicit")
                     .put("schedule", new JSONObject()
                         .put("kind", "weekly")
                         .put("weekdays", new JSONArray().put(1).put(5))
@@ -73,6 +74,13 @@ public class LocalFallbackActionAuthorityTest {
                 .put("op", "update")
                 .put("planId", "plan_1")
                 .put("patch", new JSONObject().put("title", "新标题").put("secret", "leak"))));
+        assertThrows(IllegalArgumentException.class, () -> LocalFallbackActionAuthority.validate(
+            "role_plan_update", "role_plan:plan_1", SHA_A,
+            new JSONObject()
+                .put("op", "update")
+                .put("planId", "plan_1")
+                .put("patch", new JSONObject()
+                    .put("schedule", new JSONObject().put("kind", "daily").put("time", "09:00")))));
         assertThrows(IllegalArgumentException.class, () -> LocalFallbackActionAuthority.validate(
             "role_plan_pause", "role_plan:plan_2", SHA_A,
             new JSONObject().put("op", "pause").put("planId", "plan_1")));

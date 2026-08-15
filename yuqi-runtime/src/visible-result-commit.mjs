@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { applyStanceTransitions } from './agency-state.mjs';
 import { generationFingerprint as computeGenerationFingerprint } from './interaction-lanes.mjs';
 import { contentHash } from './protocol.mjs';
+import { normalizeRolePlanOperationList } from './role-plan-operation-contract.mjs';
 import { deriveVisibleGroupId } from './store.mjs';
 import { comparisonContractForMode } from './comparison-contract.mjs';
 
@@ -83,6 +84,13 @@ function assertContiguousRolePlanActionBlock(actions) {
     && ordinals.at(-1) - ordinals[0] + 1 !== ordinals.length) {
     throw new Error('canonical role plan actions must form one contiguous ordinal block');
   }
+}
+
+function assertCanonicalRolePlanActionPayloads(actions) {
+  const operations = (Array.isArray(actions) ? actions : [])
+    .filter(action => String(action?.kind || '').startsWith('role_plan_'))
+    .map(action => action?.payload);
+  if (operations.length) normalizeRolePlanOperationList(operations);
 }
 
 function normalizeStateIntent(patch) {
@@ -324,6 +332,7 @@ export function canonicalCommitPayload(input) {
 export function commitVisibleResult(input) {
   if (!input?.store) throw new Error('visible commit store is required');
   assertContiguousRolePlanActionBlock(input.actionSet || []);
+  assertCanonicalRolePlanActionPayloads(input.actionSet || []);
   return input.store.withImmediateTransaction(() => {
     const authority = input.store.readCommitAuthority({
       turnId: input.turnId,

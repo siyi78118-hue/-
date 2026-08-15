@@ -654,6 +654,28 @@ test('external role-plan actions reject a changed nested plan target with zero w
   });
 });
 
+test('external role-plan schedule updates require canonical nested time confidence', () => {
+  withStore(store => {
+    const rolePlan = { planId: 'plan_1', title: 'source title' };
+    const candidate = actionOnlyReceiptWithInputContext({
+      kind: 'role_plan_update',
+      targetKey: 'role_plan:plan_1',
+      targetRevision: actionTargetRevision(rolePlan),
+      payload: {
+        op: 'update',
+        planId: 'plan_1',
+        patch: { schedule: { kind: 'daily', time: '09:00' } }
+      }
+    }, { input: { rolePlan } });
+    const before = rowCounts(store);
+    assert.throws(
+      () => store.importExternalVisibleReceiptInternal(candidate),
+      /canonical role plan time confidence conflict|external authority action/i
+    );
+    assert.deepEqual(rowCounts(store), before);
+  });
+});
+
 test('legal closed moment, relationship, payment, and role-plan actions remain importable', () => {
   const cases = [
     {

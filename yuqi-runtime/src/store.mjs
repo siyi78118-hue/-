@@ -2120,6 +2120,10 @@ function assertCanonicalRolePlanActionPayload(kind, payload, targetKey, targetRe
       throw new Error('canonical role plan nested target conflict');
     }
     assertCanonicalRolePlanSemanticFields(payload.patch);
+    if (Object.hasOwn(payload.patch, 'schedule')
+      && !['explicit', 'inferred'].includes(payload.patch.timeConfidence)) {
+      throw new Error('canonical role plan time confidence conflict');
+    }
   }
   if (Object.hasOwn(payload, 'reason')) {
     assertCanonicalRolePlanText(payload.reason, 'reason', 240);

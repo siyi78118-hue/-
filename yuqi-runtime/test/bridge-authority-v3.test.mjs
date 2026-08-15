@@ -1958,7 +1958,16 @@ test('v2 action compatibility map preserves role-plan order and rejects ambiguou
     terminalDisposition: 'action_only',
     replyParts: [],
     actions: [
-      action({ ordinal: 0, kind: 'role_plan_create', payload: { op: 'create', planId: 'plan_1' } }),
+      action({
+        ordinal: 0,
+        kind: 'role_plan_create',
+        payload: {
+          op: 'create', planId: 'plan_1', type: 'private_message', source: 'spoken',
+          title: '早安', intent: '明早问候',
+          schedule: { kind: 'once', at: '2026-08-16T08:00:00+08:00' },
+          timeConfidence: 'inferred'
+        }
+      }),
       action({ ordinal: 1, kind: 'role_plan_cancel', payload: { op: 'cancel', planId: 'plan_2' } }),
       action({ ordinal: 2, kind: 'payment_accept', payload: { paymentId: 'pay_1' } })
     ]
@@ -1967,7 +1976,7 @@ test('v2 action compatibility map preserves role-plan order and rejects ambiguou
   assert.equal(v2.action, 'send');
   assert.equal(v2.reply, null);
   assert.deepEqual(v2.rolePlanOperations, [
-    { op: 'create', planId: 'plan_1' },
+    canonical.actions[0].payload,
     { op: 'cancel', planId: 'plan_2' }
   ]);
   assert.equal(v2.paymentAction, 'received');
@@ -1981,6 +1990,16 @@ test('v2 action compatibility map preserves role-plan order and rejects ambiguou
   assert.throws(() => projectBridgeResultForWire({
     ...canonical,
     actions: [{ ...canonical.actions[0], kind: 'mystery_action' }]
+  }, 2), /canonical bridge result projection conflict/i);
+  assert.throws(() => projectBridgeResultForWire({
+    ...canonical,
+    actions: [{
+      ...canonical.actions[0],
+      payload: {
+        ...canonical.actions[0].payload,
+        timeConfidence: undefined
+      }
+    }]
   }, 2), /canonical bridge result projection conflict/i);
 });
 

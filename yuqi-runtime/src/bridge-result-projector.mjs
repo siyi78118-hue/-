@@ -1,4 +1,5 @@
 import { contentHash } from './protocol.mjs';
+import { normalizeRolePlanOperationList } from './role-plan-operation-contract.mjs';
 
 const FAILURE_KEYS = Object.freeze([
   'protocolVersion', 'type', 'turnId', 'roleId', 'authorityLineageKey',
@@ -215,6 +216,14 @@ function closedCanonicalResult(canonicalResult) {
       projectionConflict();
     }
   });
+  try {
+    const rolePlanOperations = result.actions
+      .filter(action => action.kind.startsWith('role_plan_'))
+      .map(action => action.payload);
+    if (rolePlanOperations.length) normalizeRolePlanOperationList(rolePlanOperations);
+  } catch {
+    projectionConflict();
+  }
   const { terminalDisposition, replyParts, actions } = result;
   if ((terminalDisposition === 'visible' && replyParts.length === 0)
     || (terminalDisposition === 'action_only' && (replyParts.length !== 0 || actions.length === 0))

@@ -418,6 +418,7 @@ public final class LocalFallbackActionAuthority {
             if (patch == null || keysOf(patch).isEmpty()
                 || !PLAN_PATCH_ALLOWED.containsAll(keysOf(patch))) conflict();
             validatePlanSemanticFields(patch, false);
+            if (patch.has("schedule") && !patch.has("timeConfidence")) conflict();
             if (payload.has("reason")) optionalText(payload, "reason", 240);
         } else {
             allowedAndRequired(payload, PLAN_TERMINAL_ALLOWED, PLAN_TERMINAL_REQUIRED);

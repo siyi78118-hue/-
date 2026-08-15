@@ -855,8 +855,19 @@ test('one contiguous role-plan action block commits with consecutive ordinals', 
       VALUES ('plan_existing', 'yuqi', 3);
     `);
     const actionInputs = [
-      { kind: 'role_plan_create', payload: { op: 'create', planId: 'plan_new' } },
-      { kind: 'role_plan_update', payload: { op: 'update', planId: 'plan_existing' } },
+      {
+        kind: 'role_plan_create',
+        payload: {
+          op: 'create', planId: 'plan_new', type: 'private_message', source: 'spoken',
+          title: '新提醒', intent: '稍后提醒',
+          schedule: { kind: 'once', at: '2026-08-16T09:00:00+08:00' },
+          timeConfidence: 'explicit'
+        }
+      },
+      {
+        kind: 'role_plan_update',
+        payload: { op: 'update', planId: 'plan_existing', patch: { title: '更新提醒' } }
+      },
       { kind: 'moment_create', payload: { privacy: 'private', content: '动作块之后' } }
     ];
     const input = commitInput(store, turn);
@@ -883,6 +894,41 @@ test('one contiguous role-plan action block commits with consecutive ordinals', 
         .map(action => action.ordinal),
       [0, 1]
     );
+  }));
+
+test('canonical commit rejects a schedule update without nested time confidence before visible writes', () =>
+  withAuthority((store, turn) => {
+    store.db.exec(`
+      CREATE TABLE role_plans(
+        plan_id TEXT PRIMARY KEY,
+        character_id TEXT NOT NULL,
+        revision INTEGER NOT NULL
+      );
+      INSERT INTO role_plans(plan_id, character_id, revision)
+      VALUES ('plan_existing', 'yuqi', 3);
+    `);
+    const action = {
+      kind: 'role_plan_update',
+      payload: {
+        op: 'update',
+        planId: 'plan_existing',
+        patch: { schedule: { kind: 'daily', time: '09:00' } }
+      }
+    };
+    const target = store.resolveCanonicalActionTargetInternal({ turn, action });
+    const input = commitInput(store, turn);
+    input.actionSet = [{ ...action, targetKey: target.targetKey, targetRevision: target.targetRevision }];
+    input.generationFingerprint = generationFingerprint({
+      roleId: turn.characterId,
+      laneKey: turn.laneKey,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      visibleGroup: input.visibleGroup,
+      actionSet: input.actionSet,
+      contextRevision: turn.agencySnapshotChecksum
+    });
+    const before = sideEffectCounts(store);
+    assert.throws(() => commitVisibleResult(input), /role plan.*time confidence/i);
+    assert.deepEqual(sideEffectCounts(store), before);
   }));
 
 test('input snapshot target id and revision must come from the same object', () =>
