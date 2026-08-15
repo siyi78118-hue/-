@@ -30,7 +30,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Yuqi-Registration'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-08-14.1';
+const CLOUD_TIMER_WORKER_VERSION = '2026-08-15.1';
 const FCM_ACK_MAX_ATTEMPTS = 8;
 let lastCronSummary = null;
 
