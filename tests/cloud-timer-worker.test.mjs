@@ -220,6 +220,46 @@ test('cron defers an automatic authority job without writing the legacy timer ta
   );
 });
 
+test('an automatic authority FCM delivery waits for recovery even when an old subscription lacks backgroundAck', async () => {
+  const store = new MemoryTimerStore();
+  const automatic = {
+    automaticAuthority: true,
+    streamKey: 'active:device-old:char-a:chat',
+    authorityEpoch: '00112233445566778899aabbccddeeff',
+    generation: 9,
+    deviceId: 'device-old',
+    characterId: 'char-a',
+    charId: 'char-a',
+    kind: 'chat',
+    jobId: 'pro_old_subscription_9',
+    dueAt: Date.now() - 60_000,
+    nextDeliveryAttemptAt: new Date(Date.now() - 60_000).toISOString()
+  };
+  let deferred = null;
+  let acknowledged = 0;
+  store.devices.set('device-old', {
+    deviceId: 'device-old', transport: 'fcm', fcmToken: 'token-old', backgroundAck: 0
+  });
+  store.dueJobs = async () => deferred ? [] : [structuredClone(automatic)];
+  store.claimAutomaticDelivery = async () => ({ claimed: true });
+  store.deferAutomaticDelivery = async input => {
+    deferred = structuredClone(input);
+    return { deferred: true };
+  };
+  store.ackAutomaticDelivery = async () => {
+    acknowledged += 1;
+    return { acknowledged: true };
+  };
+
+  await runCron(envFor(store));
+
+  assert.equal(acknowledged, 0, 'Firebase acceptance must not consume the authority generation');
+  assert.equal(deferred.streamKey, automatic.streamKey);
+  assert.equal(deferred.generation, automatic.generation);
+  assert.equal(deferred.jobId, automatic.jobId);
+  assert.equal(deferred.awaitingAck, true, 'automatic delivery must remain retryable until authority advances');
+});
+
 test('a missing push subscription never consumes an automatic authority generation', async () => {
   const store = new MemoryTimerStore();
   const automatic = {
@@ -270,6 +310,46 @@ test('manual push tests use an isolated job and never wait for automatic authori
   assert.equal(response.status, 200);
   assert.equal(sentPayloads[0].test, true);
   assert.equal(await env.AL_TIMER_STORE.getJob('manual-test-job'), null);
+});
+
+test('manual trigger cannot inject automatic authority into a legacy FCM delivery', async () => {
+  const store = new MemoryTimerStore();
+  store.devices.set('device-manual', {
+    deviceId: 'device-manual', transport: 'fcm', fcmToken: 'token-manual', backgroundAck: 0
+  });
+  let authorityDefers = 0;
+  let authorityAcks = 0;
+  store.deferAutomaticDelivery = async () => {
+    authorityDefers += 1;
+    return { deferred: true };
+  };
+  store.ackAutomaticDelivery = async () => {
+    authorityAcks += 1;
+    return { acknowledged: true };
+  };
+  const env = envFor(store);
+  sentPayloads.length = 0;
+
+  const response = await post(env, '/trigger', {
+    deviceId: 'device-manual',
+    charId: 'char-a',
+    jobId: 'manual-authority-spoof',
+    kind: 'chat',
+    automaticAuthority: true,
+    streamKey: 'active:device-manual:char-a:chat',
+    owner: 'android-v1',
+    authorityEpoch: '00112233445566778899aabbccddeeff',
+    generation: 9
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.delivered.awaitingAck, false, 'legacy backgroundAck=0 remains fire-and-forget');
+  assert.equal(authorityDefers, 0);
+  assert.equal(authorityAcks, 0);
+  assert.equal(sentPayloads[0].owner, undefined);
+  assert.equal(sentPayloads[0].authorityEpoch, undefined);
+  assert.equal(sentPayloads[0].generation, undefined);
 });
 
 test('FCM uses the documented Android high priority value and survives short offline periods', async () => {

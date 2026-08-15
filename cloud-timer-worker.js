@@ -208,7 +208,12 @@ export default {
         const body = await request.json();
         if (!body.deviceId) throw new Error('missing deviceId');
         const storedJob = body.jobId ? await timerStore(env).getJob(body.jobId) : null;
-        const job = storedJob || body;
+        const job = { ...(storedJob || body) };
+        delete job.automaticAuthority;
+        delete job.streamKey;
+        delete job.authorityEpoch;
+        delete job.generation;
+        delete job.owner;
         job.deviceId = job.deviceId || body.deviceId;
         job.jobId = job.jobId || body.jobId || `manual:${body.deviceId}:${Date.now()}`;
         job.charId = job.charId || body.charId || '';
@@ -380,7 +385,22 @@ function createD1TimerStore(db) {
       throw automaticConflict('SCHEDULE_AUTHORITY_CONFLICT', 'automatic schedule authority conflict');
     }
     if (Number(current.generation) === input.generation) {
-      if (current.schedule_checksum === input.scheduleChecksum) return 'idempotent';
+      if (current.schedule_checksum === input.scheduleChecksum) {
+        if (input.operation === 'schedule'
+            && current.state === 'paused'
+            && current.active_job_id == null
+            && current.due_at == null
+            && current.payload_json == null
+            && current.expected_previous_job_id === input.jobId) {
+          return 'recover_paused';
+        }
+        if ((input.operation === 'schedule' && ['scheduled', 'awaiting_ack'].includes(current.state))
+            || (input.operation === 'pause' && current.state === 'paused')
+            || (input.operation === 'disable' && current.state === 'disabled')) {
+          return 'idempotent';
+        }
+        throw automaticConflict('SCHEDULE_GENERATION_CONFLICT', 'automatic schedule generation conflict');
+      }
       throw automaticConflict('SCHEDULE_CHECKSUM_CONFLICT', 'automatic schedule checksum conflict');
     }
     const expectedPrevious = input.expectedPreviousJobId ?? null;
@@ -424,7 +444,7 @@ function createD1TimerStore(db) {
       const dueAt = input.operation === 'schedule' ? input.dueAt : null;
       const payloadJson = input.operation === 'schedule' ? JSON.stringify(input) : null;
       const updatedAt = Date.now();
-      const current = await automaticStream(input.streamKey);
+      let current = await automaticStream(input.streamKey);
       if (!current) {
         if (input.generation !== 1 || input.expectedPreviousJobId !== null) {
           throw automaticConflict('SCHEDULE_GENERATION_CONFLICT', 'automatic schedule generation conflict');
@@ -446,22 +466,37 @@ function createD1TimerStore(db) {
         ]);
         if (changedExactlyOne(inserted)) return { idempotent: false };
         const winner = await automaticStream(input.streamKey);
-        if (winner && assertAutomaticTransition(winner, input) === 'idempotent') return { idempotent: true };
-        throw automaticConflict('SCHEDULE_GENERATION_CONFLICT', 'automatic schedule generation conflict');
+        if (!winner) throw automaticConflict('SCHEDULE_GENERATION_CONFLICT', 'automatic schedule generation conflict');
+        const winnerTransition = assertAutomaticTransition(winner, input);
+        if (winnerTransition === 'idempotent') return { idempotent: true };
+        if (winnerTransition !== 'recover_paused') {
+          throw automaticConflict('SCHEDULE_GENERATION_CONFLICT', 'automatic schedule generation conflict');
+        }
+        current = winner;
       }
-      if (assertAutomaticTransition(current, input) === 'idempotent') return { idempotent: true };
+      const transitionKind = assertAutomaticTransition(current, input);
+      if (transitionKind === 'idempotent') return { idempotent: true };
       const updated = await db.prepare(`UPDATE timer_stream_authorities SET
           generation = ?2, state = ?3, active_job_id = ?4, due_at = ?5, payload_json = ?6,
           expected_previous_job_id = ?7, schedule_checksum = ?8, delivery_attempts = 0, updated_at = ?9
         WHERE logical_key = ?1 AND owner = ?11 AND authority_epoch = ?12 AND generation = ?13
           AND ((active_job_id = ?14) OR (active_job_id IS NULL AND ?14 IS NULL))
           AND schedule_checksum = ?15
+          AND state = ?16
+          AND ((due_at = ?17) OR (due_at IS NULL AND ?17 IS NULL))
+          AND ((payload_json = ?18) OR (payload_json IS NULL AND ?18 IS NULL))
+          AND ((expected_previous_job_id = ?19) OR (expected_previous_job_id IS NULL AND ?19 IS NULL))
         RETURNING logical_key`)
         .bind(input.streamKey, input.generation, state, activeJobId, dueAt, payloadJson,
           input.expectedPreviousJobId, input.scheduleChecksum, updatedAt, null,
           current.owner, current.authority_epoch, current.generation, current.active_job_id,
-          current.schedule_checksum).run();
-      if (changedExactlyOne(updated)) return { idempotent: false };
+          current.schedule_checksum, current.state, current.due_at, current.payload_json,
+          current.expected_previous_job_id).run();
+      if (changedExactlyOne(updated)) {
+        return transitionKind === 'recover_paused'
+          ? { idempotent: false, recovered: true }
+          : { idempotent: false };
+      }
       const winner = await automaticStream(input.streamKey);
       if (winner && assertAutomaticTransition(winner, input) === 'idempotent') return { idempotent: true };
       throw automaticConflict('SCHEDULE_GENERATION_CONFLICT', 'automatic schedule generation conflict');
@@ -848,7 +883,7 @@ async function deliverJob(job, env) {
     return { ok: false, reason: 'subscription expired', jobId: job.jobId, retry: true };
   }
   if (!result.ok) return { ok: false, reason: result.reason || 'push failed', jobId: job.jobId, retry: true };
-  return { ok: true, jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', test: !!job.test, retry: false, awaitingAck: !job.test && result.transport === 'fcm' && Number(target.backgroundAck) >= 1, transport: result.transport || '' };
+  return { ok: true, jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', test: !!job.test, retry: false, awaitingAck: !job.test && result.transport === 'fcm' && (job.automaticAuthority || Number(target.backgroundAck) >= 1), transport: result.transport || '' };
 }
 
 async function getRecentEvents(env) {

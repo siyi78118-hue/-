@@ -714,7 +714,7 @@ assert.match(cloudTimerWorker, /url\.pathname === '\/cancel-device-tasks'/);
 assert.match(cloudTimerWorker, /async function sendFcmPush/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/ack'/);
 assert.match(cloudTimerWorker, /async function deferForFcmAck/);
-assert.match(cloudTimerWorker, /awaitingAck: !job\.test && result\.transport === 'fcm' && Number\(target\.backgroundAck\) >= 1/);
+assert.match(cloudTimerWorker, /awaitingAck: !job\.test && result\.transport === 'fcm' && \(job\.automaticAuthority \|\| Number\(target\.backgroundAck\) >= 1\)/);
 assert.match(cloudTimerWorker, /firebase\.messaging/);
 assert.match(script, /async function enableNativeCloudTimer/);
 assert.match(cloudTimerWorker, /AL_TIMER_DB binding is missing/);

@@ -69,12 +69,19 @@ class SingleJobD1 {
 }
 
 class StreamAuthorityD1 {
-  constructor({ claimMetaChangesZero = false, mutationMetaChangesZero = false } = {}) {
+  constructor({
+    claimMetaChangesZero = false,
+    mutationMetaChangesZero = false,
+    beforeTransitionUpdate = null,
+    hideNextStreamRead = false
+  } = {}) {
     this.rows = new Map();
     this.legacyRows = new Map();
     this.writeCount = 0;
     this.claimMetaChangesZero = claimMetaChangesZero;
     this.mutationMetaChangesZero = mutationMetaChangesZero;
+    this.beforeTransitionUpdate = beforeTransitionUpdate;
+    this.hideNextStreamRead = hideNextStreamRead;
   }
 
   async batch(statements) {
@@ -89,6 +96,10 @@ class StreamAuthorityD1 {
         first: async () => {
           if (!sql.includes('FROM timer_stream_authorities') || !sql.includes('logical_key = ?1')) {
             throw new Error(`unexpected stream first SQL: ${sql}`);
+          }
+          if (this.hideNextStreamRead) {
+            this.hideNextStreamRead = false;
+            return null;
           }
           return structuredClone(this.rows.get(args[0]) || null);
         },
@@ -111,7 +122,7 @@ class StreamAuthorityD1 {
               : { meta: { changes: 1 } };
           }
           if (sql.includes('UPDATE timer_stream_authorities')) {
-            const current = this.rows.get(args[0]);
+            let current = this.rows.get(args[0]);
             if (sql.includes('due_at = ?5') && sql.includes('due_at = ?6')) {
               const matches = current && current.authority_epoch === args[1]
                 && current.generation === args[2] && current.active_job_id === args[3]
@@ -157,12 +168,22 @@ class StreamAuthorityD1 {
                 ? { results: sql.includes('RETURNING logical_key') ? [{ logical_key: args[0] }] : [], meta: { changes: 0 } }
                 : { meta: { changes: 1 } };
             }
+            if (this.beforeTransitionUpdate) {
+              const mutate = this.beforeTransitionUpdate;
+              this.beforeTransitionUpdate = null;
+              mutate(this.rows, args[0]);
+              current = this.rows.get(args[0]);
+            }
             const matches = current
               && current.owner === args[10]
               && current.authority_epoch === args[11]
               && current.generation === args[12]
               && (current.active_job_id ?? null) === (args[13] ?? null)
-              && current.schedule_checksum === args[14];
+              && current.schedule_checksum === args[14]
+              && (!sql.includes('state = ?16') || current.state === args[15])
+              && (!sql.includes('due_at = ?17') || (current.due_at ?? null) === (args[16] ?? null))
+              && (!sql.includes('payload_json = ?18') || (current.payload_json ?? null) === (args[17] ?? null))
+              && (!sql.includes('expected_previous_job_id = ?19') || (current.expected_previous_job_id ?? null) === (args[18] ?? null));
             if (!matches) return { meta: { changes: 0 } };
             this.rows.set(args[0], {
               ...current, generation: args[1], state: args[2], active_job_id: args[3], due_at: args[4],
@@ -616,6 +637,180 @@ test('the phone may advance from a cloud-acknowledged generation using its deliv
   assert.deepEqual(await store.transitionAutomaticStream(second), { idempotent: false });
   assert.equal(db.rows.get(first.streamKey).generation, 2);
   assert.equal(db.rows.get(first.streamKey).active_job_id, second.jobId);
+});
+
+test('an exact schedule replay restores only the empty paused shell left by cloud acknowledgement', async () => {
+  const fixture = JSON.parse(await readFile(new URL('./fixtures/automatic-schedule-authority-v1.json', import.meta.url), 'utf8'));
+  const scheduled = fixture.vectors[0].transition;
+  const db = new StreamAuthorityD1();
+  const store = createD1TimerStore(db);
+
+  assert.deepEqual(await store.transitionAutomaticStream(scheduled), { idempotent: false });
+  await store.ackAutomaticDelivery({
+    streamKey: scheduled.streamKey,
+    authorityEpoch: scheduled.authorityEpoch,
+    generation: scheduled.generation,
+    jobId: scheduled.jobId
+  });
+  const pausedShell = structuredClone(db.rows.get(scheduled.streamKey));
+  assert.equal(pausedShell.state, 'paused');
+  assert.equal(pausedShell.active_job_id, null);
+  assert.equal(pausedShell.due_at, null);
+  assert.equal(pausedShell.payload_json, null);
+  assert.equal(pausedShell.expected_previous_job_id, scheduled.jobId);
+
+  assert.deepEqual(await store.transitionAutomaticStream(scheduled), { idempotent: false, recovered: true });
+  const recovered = db.rows.get(scheduled.streamKey);
+  assert.equal(recovered.generation, scheduled.generation);
+  assert.equal(recovered.state, 'scheduled');
+  assert.equal(recovered.active_job_id, scheduled.jobId);
+  assert.equal(recovered.due_at, scheduled.dueAt);
+  assert.deepEqual(JSON.parse(recovered.payload_json), scheduled);
+  assert.equal(recovered.schedule_checksum, scheduled.scheduleChecksum);
+
+  const recoverySnapshot = structuredClone(recovered);
+  assert.deepEqual(await store.transitionAutomaticStream(scheduled), { idempotent: true });
+  assert.deepEqual(db.rows.get(scheduled.streamKey), recoverySnapshot, 'healthy exact replay must not rewrite timestamps');
+});
+
+test('same-generation replay cannot revive a user pause or a malformed paused shell', async () => {
+  const fixture = JSON.parse(await readFile(new URL('./fixtures/automatic-schedule-authority-v1.json', import.meta.url), 'utf8'));
+  const scheduled = fixture.vectors[0].transition;
+  const directPause = await nextTransition(scheduled, {
+    operation: 'pause', jobId: null, dueAt: null, mode: null, sourceType: 'direct_input'
+  });
+
+  const directDb = new StreamAuthorityD1();
+  const directStore = createD1TimerStore(directDb);
+  await directStore.transitionAutomaticStream(scheduled);
+  await directStore.transitionAutomaticStream(directPause);
+  const directSnapshot = structuredClone(directDb.rows.get(scheduled.streamKey));
+  await assert.rejects(
+    () => directStore.transitionAutomaticStream(scheduled),
+    error => error.code === 'SCHEDULE_GENERATION_CONFLICT'
+  );
+  assert.deepEqual(directDb.rows.get(scheduled.streamKey), directSnapshot);
+
+  for (const corrupt of [
+    { active_job_id: scheduled.jobId },
+    { due_at: scheduled.dueAt },
+    { payload_json: JSON.stringify(scheduled) },
+    { expected_previous_job_id: 'pro_foreign_job_1' }
+  ]) {
+    const db = new StreamAuthorityD1();
+    const store = createD1TimerStore(db);
+    await store.transitionAutomaticStream(scheduled);
+    await store.ackAutomaticDelivery({
+      streamKey: scheduled.streamKey,
+      authorityEpoch: scheduled.authorityEpoch,
+      generation: scheduled.generation,
+      jobId: scheduled.jobId
+    });
+    db.rows.set(scheduled.streamKey, { ...db.rows.get(scheduled.streamKey), ...corrupt });
+    const before = structuredClone(db.rows.get(scheduled.streamKey));
+    await assert.rejects(
+      () => store.transitionAutomaticStream(scheduled),
+      error => error.code === 'SCHEDULE_GENERATION_CONFLICT'
+    );
+    assert.deepEqual(db.rows.get(scheduled.streamKey), before, 'nonempty or foreign paused shells must not be recovered');
+  }
+});
+
+test('paused-shell recovery loses its CAS when another writer changes the inspected shell', async () => {
+  const fixture = JSON.parse(await readFile(new URL('./fixtures/automatic-schedule-authority-v1.json', import.meta.url), 'utf8'));
+  const scheduled = fixture.vectors[0].transition;
+  const db = new StreamAuthorityD1();
+  const store = createD1TimerStore(db);
+  await store.transitionAutomaticStream(scheduled);
+  await store.ackAutomaticDelivery({
+    streamKey: scheduled.streamKey,
+    authorityEpoch: scheduled.authorityEpoch,
+    generation: scheduled.generation,
+    jobId: scheduled.jobId
+  });
+  db.beforeTransitionUpdate = (rows, streamKey) => {
+    rows.set(streamKey, {
+      ...rows.get(streamKey),
+      state: 'disabled',
+      expected_previous_job_id: null,
+      updated_at: 999_999
+    });
+  };
+
+  await assert.rejects(
+    () => store.transitionAutomaticStream(scheduled),
+    error => error.code === 'SCHEDULE_GENERATION_CONFLICT'
+  );
+  assert.equal(db.rows.get(scheduled.streamKey).state, 'disabled');
+  assert.equal(db.rows.get(scheduled.streamKey).active_job_id, null);
+  assert.equal(db.rows.get(scheduled.streamKey).payload_json, null);
+  assert.equal(db.rows.get(scheduled.streamKey).updated_at, 999_999);
+});
+
+test('an insert loser recovers an exact paused winner and two recovery callers converge once', async () => {
+  const fixture = JSON.parse(await readFile(new URL('./fixtures/automatic-schedule-authority-v1.json', import.meta.url), 'utf8'));
+  const scheduled = fixture.vectors[0].transition;
+  const db = new StreamAuthorityD1();
+  const store = createD1TimerStore(db);
+  await store.transitionAutomaticStream(scheduled);
+  await store.ackAutomaticDelivery({
+    streamKey: scheduled.streamKey,
+    authorityEpoch: scheduled.authorityEpoch,
+    generation: scheduled.generation,
+    jobId: scheduled.jobId
+  });
+
+  db.hideNextStreamRead = true;
+  assert.deepEqual(await store.transitionAutomaticStream(scheduled), { idempotent: false, recovered: true });
+  await store.ackAutomaticDelivery({
+    streamKey: scheduled.streamKey,
+    authorityEpoch: scheduled.authorityEpoch,
+    generation: scheduled.generation,
+    jobId: scheduled.jobId
+  });
+
+  const results = await Promise.all([
+    createD1TimerStore(db).transitionAutomaticStream(scheduled),
+    createD1TimerStore(db).transitionAutomaticStream(scheduled)
+  ]);
+  assert.deepEqual(results.sort((left, right) => Number(left.idempotent) - Number(right.idempotent)), [
+    { idempotent: false, recovered: true },
+    { idempotent: true }
+  ]);
+  assert.equal(db.rows.get(scheduled.streamKey).state, 'scheduled');
+  assert.equal(db.rows.get(scheduled.streamKey).active_job_id, scheduled.jobId);
+});
+
+test('awaiting-ack schedule replay is immutable and a foreign identity cannot recover a paused shell', async () => {
+  const fixture = JSON.parse(await readFile(new URL('./fixtures/automatic-schedule-authority-v1.json', import.meta.url), 'utf8'));
+  const scheduled = fixture.vectors[0].transition;
+  const db = new StreamAuthorityD1();
+  const store = createD1TimerStore(db);
+  await store.transitionAutomaticStream(scheduled);
+  await store.deferAutomaticDelivery({
+    streamKey: scheduled.streamKey,
+    authorityEpoch: scheduled.authorityEpoch,
+    generation: scheduled.generation,
+    jobId: scheduled.jobId,
+    nextAttemptAt: scheduled.dueAt + 60_000,
+    awaitingAck: true
+  });
+  const awaitingSnapshot = structuredClone(db.rows.get(scheduled.streamKey));
+  assert.deepEqual(await store.transitionAutomaticStream(scheduled), { idempotent: true });
+  assert.deepEqual(db.rows.get(scheduled.streamKey), awaitingSnapshot);
+
+  await store.ackAutomaticDelivery({
+    streamKey: scheduled.streamKey,
+    authorityEpoch: scheduled.authorityEpoch,
+    generation: scheduled.generation,
+    jobId: scheduled.jobId
+  });
+  const pausedSnapshot = structuredClone(db.rows.get(scheduled.streamKey));
+  await assert.rejects(
+    () => store.transitionAutomaticStream({ ...scheduled, deviceId: 'device-foreign' }),
+    error => error.code === 'SCHEDULE_AUTHORITY_CONFLICT'
+  );
+  assert.deepEqual(db.rows.get(scheduled.streamKey), pausedSnapshot);
 });
 
 test('automatic schedule contract freezes canonical bytes and rejects coerced native types', async () => {
