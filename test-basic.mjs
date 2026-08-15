@@ -709,7 +709,7 @@ const runDueJobsSource = cloudTimerWorkerCode.slice(
   cloudTimerWorkerCode.indexOf('async function getLastCron')
 );
 assert.doesNotMatch(runDueJobsSource, /\.list\s*\(/, 'cron path must not scan KV');
-assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-08-15\.8';/);
+assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-08-15\.9';/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/cancel-device-tasks'/);
 assert.match(cloudTimerWorker, /async function sendFcmPush/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/ack'/);
@@ -774,7 +774,7 @@ assert.match(wranglerRunScript, /resolveWranglerInvocation/);
 assert.match(wranglerInvocationScript, /node_modules.*wrangler.*bin.*wrangler\.js/s);
 assert.match(wranglerInvocationScript, /shell: false/);
 assert.match(cloudTimerDeployScript, /scripts\/check-cloud-timer\.mjs/);
-assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-08-15\.8'/);
+assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-08-15\.9'/);
 assert.match(cloudTimerHealthScript, /Cron: ok=/);
 assert.match(cloudTimerDeployDoc, /CLOUDFLARE_API_TOKEN/);
 assert.match(cloudTimerDeployDoc, /npm run cloud:deploy/);
