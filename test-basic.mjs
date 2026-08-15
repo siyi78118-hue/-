@@ -219,6 +219,12 @@ assert.match(script, /function normalizeApiBaseUrl\(value, label = '接口'\)/);
 assert.match(html, /<script src="lib\/api-endpoint\.js"><\/script>/);
 assert.match(apiEndpointHelper, /请求落到了网页而不是模型接口/);
 assert.match(script, /capabilities: \{ backgroundAck: 1 \}/);
+assert.match(script, /async function nativeCloudTargetDeviceIds\(\)/,
+  'native cloud registration must resolve every device identity used by automatic schedules');
+assert.match(script, /plugin\.loadBridgeConfig\(\)/,
+  'native cloud registration must include the bridge device identity used by schedule authority');
+assert.match(script, /for \(const deviceId of await nativeCloudTargetDeviceIds\(\)\)/,
+  'the FCM token must be registered for both the app and schedule-authority identities');
 assert.match(script, /refreshNativeCloudRegistration\(\)/);
 assert.match(swScript, /API returned HTML page/);
 assert.equal(capacitorConfig.appId, 'com.siyi.al');

@@ -11003,14 +11003,34 @@ async function requestNativeFcmToken() {
   await PushNotifications.register();
   return tokenPromise;
 }
+async function nativeCloudTargetDeviceIds() {
+  const deviceIds = new Set();
+  const appDeviceId = String(settings.deviceId || '').trim();
+  if (appDeviceId) deviceIds.add(appDeviceId);
+  if (isNativeApp()) {
+    const plugin = nativeExecutionPlugin();
+    if (plugin?.loadBridgeConfig) {
+      const bridge = await nativeBridgeCall(
+        plugin.loadBridgeConfig(), 'loadBridgeConfig', 5000);
+      const scheduleDeviceId = String(bridge?.deviceId || '').trim();
+      if (scheduleDeviceId) deviceIds.add(scheduleDeviceId);
+    }
+  }
+  return [...deviceIds];
+}
 async function registerNativeCloudTarget(token) {
-  if (!settings.timerEndpoint || !settings.deviceId || !token) return false;
-  const resp = await fetchWithTimeout(timerUrl('/register'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ deviceId: settings.deviceId, transport: 'fcm', fcmToken: token, capabilities: { backgroundAck: 1 } })
-  }, API_TIMEOUT_MS);
-  if (!resp.ok) throw new Error('FCM 云闹钟注册失败：' + resp.status);
+  if (!settings.timerEndpoint || !token) return false;
+  let registered = 0;
+  for (const deviceId of await nativeCloudTargetDeviceIds()) {
+    const resp = await fetchWithTimeout(timerUrl('/register'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId, transport: 'fcm', fcmToken: token, capabilities: { backgroundAck: 1 } })
+    }, API_TIMEOUT_MS);
+    if (!resp.ok) throw new Error('FCM 云闹钟注册失败：' + resp.status);
+    registered += 1;
+  }
+  if (!registered) throw new Error('FCM 云闹钟设备身份缺失');
   clearCloudTimerQuotaPause();
   return true;
 }
