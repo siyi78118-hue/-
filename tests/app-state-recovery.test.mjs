@@ -175,3 +175,78 @@ test('a recovery decision remains frozen until a verified commit explicitly unlo
   assert.equal(guard.recoveryChecksum, 'candidate-checksum');
 });
 
+test('native recovery census excludes tombstoned roles before source selection', () => {
+  const { sanitizeNativeCensus } = recoveryModule();
+  const census = sanitizeNativeCensus({
+    roleCount: 2,
+    roles: [
+      { characterId: 'yuqi', displayName: '虞栖', candidateAvailable: true },
+      { characterId: 'deleted', displayName: '已删除', candidateAvailable: true, tombstoned: true }
+    ],
+    databaseBytes: 100,
+    walBytes: 20,
+    shmBytes: 10
+  });
+  assert.equal(census.roleCount, 1);
+  assert.deepEqual(census.roles.map(row => row.characterId), ['yuqi']);
+});
+
+test('conflicting native role identities fail closed into diagnostic-only mode', () => {
+  const { decideRecovery } = recoveryModule();
+  const result = decideRecovery({
+    local: webState(),
+    mirror: webState(),
+    native: {
+      roleCount: 2,
+      roles: [
+        { characterId: 'yuqi', displayName: '虞栖', candidateAvailable: true, sourceChecksum: 'a'.repeat(64) },
+        { characterId: 'yuqi', displayName: '另一个虞栖', candidateAvailable: true, sourceChecksum: 'b'.repeat(64) }
+      ]
+    }
+  });
+  assert.deepEqual(result, {
+    mode: 'diagnostic_only', frozen: true, source: '', reasonCode: 'NATIVE_RECOVERY_CENSUS_CONFLICT'
+  });
+});
+
+test('recovery screen model exposes metadata but never semantic fields', () => {
+  const { buildRecoveryScreenModel } = recoveryModule();
+  const model = buildRecoveryScreenModel({
+    mode: 'native_candidate', frozen: true, source: 'native', reasonCode: 'WEB_ROLE_DIRECTORY_MISSING',
+    native: {
+      roleCount: 1,
+      databaseBytes: 6000,
+      walBytes: 200,
+      shmBytes: 100,
+      roles: [{
+        characterId: 'yuqi', displayName: '虞栖', rawMessageCount: 200,
+        systemPrompt: 'secret prompt', content: 'secret message'
+      }]
+    }
+  });
+  assert.equal(model.sourceName, '手机原生数据库');
+  assert.deepEqual(model.roles, [{ characterId: 'yuqi', displayName: '虞栖', rawMessageCount: 200 }]);
+  assert.equal(JSON.stringify(model).includes('secret'), false);
+});
+
+test('mirror and legacy recovery screen models retain only safe role labels', () => {
+  const { buildRecoveryScreenModel } = recoveryModule();
+  const mirror = buildRecoveryScreenModel({
+    mode: 'restore_mirror', frozen: true, source: 'mirror', reasonCode: 'LOCAL_ROLE_DIRECTORY_EMPTY',
+    mirror: {
+      characters: [{ id: 'yuqi', name: '虞栖', systemPrompt: 'secret prompt' }],
+      allChats: { yuqi: { messages: [{ id: 'm1', content: 'secret message' }] } }
+    }
+  });
+  assert.equal(mirror.roleCount, 1);
+  assert.deepEqual(mirror.roles, [{ characterId: 'yuqi', displayName: '虞栖', rawMessageCount: 1 }]);
+  assert.equal(JSON.stringify(mirror).includes('secret'), false);
+
+  const legacy = buildRecoveryScreenModel({
+    mode: 'restore_legacy', frozen: true, source: 'legacy', reasonCode: 'PRIMARY_ROLE_DIRECTORY_INVALID',
+    local: { characters: [{ id: 'yuqi', name: '虞栖', systemPrompt: 'secret' }], allChats: {} }
+  });
+  assert.equal(legacy.roleCount, 1);
+  assert.equal(legacy.roles[0].displayName, '虞栖');
+});
+

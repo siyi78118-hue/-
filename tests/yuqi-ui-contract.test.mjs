@@ -1846,3 +1846,16 @@ test('phone recovery guard owns the first native boot decision and blocks state 
   }
   assert.match(boot, /if\s*\(recoveryDecision\.frozen\)\s*\{[\s\S]*renderAppStateRecoveryBlocker/);
 });
+
+test('frozen phone recovery screen exposes only recovery and metadata-copy actions', () => {
+  const screen = html.slice(
+    html.indexOf('function renderAppStateRecoveryScreen'),
+    html.indexOf('async function syncFromServiceWorkerState')
+  );
+  assert.match(screen, /恢复角色入口/);
+  assert.match(screen, /复制诊断/);
+  assert.match(screen, /commitAppStateRecovery/);
+  assert.doesNotMatch(screen, /新建角色|导入备份|清空存储/);
+  assert.match(screen, /databaseBytes/);
+  assert.match(screen, /rawMessageCount/);
+});

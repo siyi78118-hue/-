@@ -75,7 +75,114 @@
     return { mode, frozen, source, reasonCode };
   }
 
+  function safeCount(value) {
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= 0 ? number : 0;
+  }
+
+  function sanitizeNativeCensus(native = {}) {
+    if (!native || typeof native !== 'object') return { unavailable: true };
+    if (native.unavailable === true) return { unavailable: true };
+    if (!Array.isArray(native.roles)) {
+      return {
+        roleCount: safeCount(native.roleCount),
+        roles: [],
+        databaseBytes: safeCount(native.databaseBytes),
+        walBytes: safeCount(native.walBytes),
+        shmBytes: safeCount(native.shmBytes),
+        conflict: false
+      };
+    }
+    const roles = [];
+    const seen = new Map();
+    let conflict = false;
+    for (const raw of native.roles) {
+      if (!raw || typeof raw !== 'object' || raw.tombstoned === true) continue;
+      const characterId = typeof raw.characterId === 'string' ? raw.characterId.trim() : '';
+      if (!characterId) {
+        conflict = true;
+        continue;
+      }
+      const sourceChecksum = typeof raw.sourceChecksum === 'string' ? raw.sourceChecksum : '';
+      if (seen.has(characterId)) {
+        const prior = seen.get(characterId);
+        if (!sourceChecksum || !prior || sourceChecksum !== prior) conflict = true;
+        else conflict = true;
+        continue;
+      }
+      seen.set(characterId, sourceChecksum);
+      roles.push({
+        characterId,
+        displayName: typeof raw.displayName === 'string' && raw.displayName
+          ? raw.displayName : characterId,
+        latestSnapshotAt: safeCount(raw.latestSnapshotAt),
+        turnCount: safeCount(raw.turnCount),
+        rawMessageCount: safeCount(raw.rawMessageCount),
+        replyPartCount: safeCount(raw.replyPartCount),
+        memoryCount: safeCount(raw.memoryCount),
+        rolePlanCount: safeCount(raw.rolePlanCount),
+        candidateAvailable: raw.candidateAvailable === true,
+        ...(sourceChecksum ? { sourceChecksum } : {})
+      });
+    }
+    roles.sort((left, right) => left.characterId.localeCompare(right.characterId));
+    return {
+      roleCount: roles.length,
+      roles,
+      databaseBytes: safeCount(native.databaseBytes),
+      walBytes: safeCount(native.walBytes),
+      shmBytes: safeCount(native.shmBytes),
+      conflict
+    };
+  }
+
+  function buildRecoveryScreenModel(recoveryDecision = {}) {
+    const native = sanitizeNativeCensus(recoveryDecision.native || {});
+    const sourceNames = {
+      native: '手机原生数据库',
+      mirror: '手机网页镜像',
+      legacy: '旧版网页存储'
+    };
+    let roles;
+    if (recoveryDecision.source === 'native') {
+      roles = native.roles.map(role => ({
+        characterId: role.characterId,
+        displayName: role.displayName,
+        rawMessageCount: role.rawMessageCount
+      }));
+    } else {
+      const sourceState = recoveryDecision.source === 'mirror'
+        ? recoveryDecision.mirror : recoveryDecision.local;
+      const sourceChats = sourceState?.allChats && typeof sourceState.allChats === 'object'
+        ? sourceState.allChats : {};
+      roles = (Array.isArray(sourceState?.characters) ? sourceState.characters : [])
+        .filter(role => role && typeof role.id === 'string' && role.id)
+        .map(role => ({
+          characterId: role.id,
+          displayName: typeof role.name === 'string' && role.name ? role.name : role.id,
+          rawMessageCount: Array.isArray(sourceChats[role.id]?.messages)
+            ? sourceChats[role.id].messages.length : 0
+        }));
+    }
+    return {
+      mode: String(recoveryDecision.mode || 'diagnostic_only'),
+      reasonCode: String(recoveryDecision.reasonCode || 'UNKNOWN'),
+      source: String(recoveryDecision.source || ''),
+      sourceName: sourceNames[recoveryDecision.source] || '仅诊断',
+      roleCount: roles.length,
+      databaseBytes: native.databaseBytes || 0,
+      walBytes: native.walBytes || 0,
+      shmBytes: native.shmBytes || 0,
+      roles
+    };
+  }
+
   function decideRecovery({ local = {}, mirror = {}, native = {} } = {}) {
+    const verifiedNative = sanitizeNativeCensus(native);
+    if (verifiedNative.conflict === true) {
+      return decision('diagnostic_only', true, '', 'NATIVE_RECOVERY_CENSUS_CONFLICT');
+    }
+    native = verifiedNative;
     if (local.invalidCritical === true) {
       if (hasRoles(mirror)) return decision('restore_mirror', true, 'mirror', 'LOCAL_STATE_INVALID');
       if (Number(native.roleCount) > 0) return decision('native_candidate', true, 'native', 'LOCAL_STATE_INVALID');
@@ -173,6 +280,8 @@
 
   return Object.freeze({
     readStorageSlot,
+    sanitizeNativeCensus,
+    buildRecoveryScreenModel,
     decideRecovery,
     mergeRecoveryState,
     createWriteGuard

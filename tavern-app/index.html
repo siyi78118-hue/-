@@ -968,6 +968,7 @@ button.cell:active{background:#ececec}
 const AppStateRecovery = window.ALAppStateRecovery;
 if (!AppStateRecovery) throw new Error('APP_STATE_RECOVERY_MODULE_MISSING');
 const appStateRecoveryGuard = AppStateRecovery.createWriteGuard();
+let currentAppStateRecoveryDecision = null;
 const APP_STATE_CRITICAL_KEYS = new Set(['settings', 'characters', 'chats', 'moments']);
 const appStateRecoverySlots = new Map();
 const DB = {
@@ -13749,16 +13750,51 @@ async function prepareAppStateRecovery() {
     console.warn('[AL Recovery] mirror census unavailable:', error?.message || error);
     mirror = { unavailable: true };
   }
-  const native = await inspectNativeAppRecoveryState();
+  const native = AppStateRecovery.sanitizeNativeCensus(await inspectNativeAppRecoveryState());
   const recoveryDecision = AppStateRecovery.decideRecovery({ local, mirror: mirror || {}, native });
   recoveryDecision.local = local;
   recoveryDecision.mirror = mirror;
   recoveryDecision.native = native;
+  currentAppStateRecoveryDecision = recoveryDecision;
   appStateRecoveryGuard.applyDecision(recoveryDecision);
   return recoveryDecision;
 }
 
-function renderAppStateRecoveryBlocker(recoveryDecision) {
+function formatRecoveryBytes(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+async function copyAppStateRecoveryDiagnostics(recoveryDecision) {
+  const diagnostic = AppStateRecovery.buildRecoveryScreenModel(recoveryDecision);
+  const text = JSON.stringify(diagnostic, null, 2);
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const area = document.createElement('textarea');
+  area.value = text;
+  document.body.appendChild(area);
+  area.select();
+  document.execCommand('copy');
+  area.remove();
+}
+
+async function commitAppStateRecovery(source) {
+  const recoveryDecision = currentAppStateRecoveryDecision;
+  if (!recoveryDecision?.frozen || recoveryDecision.source !== source) {
+    throw new Error('APP_STATE_RECOVERY_SOURCE_CONFLICT');
+  }
+  if (typeof executeAppStateRecoveryCommit !== 'function') {
+    throw new Error('APP_STATE_RECOVERY_COMMIT_NOT_READY');
+  }
+  return executeAppStateRecoveryCommit(recoveryDecision);
+}
+
+function renderAppStateRecoveryScreen(recoveryDecision) {
   const app = document.getElementById('app') || document.body;
   let blocker = document.getElementById('app-state-recovery-blocker');
   if (!blocker) {
@@ -13768,11 +13804,38 @@ function renderAppStateRecoveryBlocker(recoveryDecision) {
     blocker.style.cssText = 'position:absolute;inset:0;z-index:10000;background:#faf8f3;padding:calc(var(--safe-top) + 40px) 24px 40px;overflow:auto;color:#222';
     app.appendChild(blocker);
   }
-  const roleCount = Number(recoveryDecision?.native?.roleCount) || 0;
+  const model = AppStateRecovery.buildRecoveryScreenModel(recoveryDecision);
+  const roles = model.roles.map(role => `<li style="margin:8px 0">${esc(role.displayName)} · ${Number(role.rawMessageCount) || 0} 条原生消息</li>`).join('');
+  const canRecover = model.source && model.mode !== 'diagnostic_only' && model.roleCount > 0;
   blocker.innerHTML = `<h1 style="font-size:22px;margin:0 0 18px">手机数据保护模式</h1>
-    <p style="line-height:1.8;margin:0 0 14px">检测到网页角色目录未能安全读取，已暂停所有写入。</p>
-    <p style="line-height:1.8;margin:0;color:#666">原生角色证据：${roleCount} 个<br>原因：${String(recoveryDecision?.reasonCode || 'UNKNOWN')}</p>
-    <p style="line-height:1.8;margin:18px 0 0;color:#666">请勿清除存储、卸载、新建角色或导入备份。</p>`;
+    <p style="line-height:1.8;margin:0 0 14px">检测到网页角色入口缺失，所有后台写入已暂停。手机原生数据没有被此页面修改。</p>
+    <div style="background:#fff;border-radius:14px;padding:16px;line-height:1.75">
+      <div>恢复来源：${esc(model.sourceName)}</div>
+      <div>角色证据：${model.roleCount} 个</div>
+      <div>数据库：${formatRecoveryBytes(model.databaseBytes)}</div>
+      <div>WAL：${formatRecoveryBytes(model.walBytes)} · SHM：${formatRecoveryBytes(model.shmBytes)}</div>
+      <div>原因：${esc(model.reasonCode)}</div>
+      ${roles ? `<ul style="padding-left:20px;margin:12px 0 0">${roles}</ul>` : ''}
+    </div>
+    <div id="app-state-recovery-error" style="color:#a33;line-height:1.6;margin-top:12px"></div>
+    <button id="app-state-recovery-commit" ${canRecover ? '' : 'disabled'} style="width:100%;margin-top:18px;padding:13px;border:0;border-radius:12px;background:#315f52;color:#fff;font-size:16px">恢复角色入口</button>
+    <button id="app-state-recovery-copy" style="width:100%;margin-top:10px;padding:12px;border:1px solid #bbb;border-radius:12px;background:#fff;font-size:15px">复制诊断</button>
+    <p style="line-height:1.8;margin:18px 0 0;color:#666">恢复完成前请勿执行其他数据操作。</p>`;
+  blocker.querySelector('#app-state-recovery-copy')?.addEventListener('click', () => {
+    copyAppStateRecoveryDiagnostics(recoveryDecision).then(() => toast('诊断已复制'))
+      .catch(error => { blocker.querySelector('#app-state-recovery-error').textContent = error?.message || '复制失败'; });
+  });
+  blocker.querySelector('#app-state-recovery-commit')?.addEventListener('click', event => {
+    event.currentTarget.disabled = true;
+    commitAppStateRecovery(model.source).catch(error => {
+      event.currentTarget.disabled = false;
+      blocker.querySelector('#app-state-recovery-error').textContent = error?.message || '恢复未完成';
+    });
+  });
+}
+
+function renderAppStateRecoveryBlocker(recoveryDecision) {
+  renderAppStateRecoveryScreen(recoveryDecision);
 }
 
 async function syncFromServiceWorkerState(options = {}) {
