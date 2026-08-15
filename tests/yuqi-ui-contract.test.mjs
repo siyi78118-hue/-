@@ -1814,3 +1814,35 @@ test('Task15 completion handling has one shared event/poll/reload drain and disp
   assert.match(html, /正在把消息送过去/);
   assert.match(html, /消息已到云端，正在等待电脑接收/);
 });
+
+test('phone recovery guard owns the first native boot decision and blocks state writers', () => {
+  assert.match(html, /<script src="\.\/lib\/app-state-recovery\.js"><\/script>/);
+  const db = html.slice(html.indexOf('const DB ='), html.indexOf('const EMOJI_CATEGORIES'));
+  assert.match(db, /appStateRecoveryGuard\.assertWritable\(k\)/);
+
+  const mirror = html.slice(
+    html.indexOf('async function mirrorAppStateNow'),
+    html.indexOf('async function mirrorAppState()')
+  );
+  assert.match(mirror, /appStateRecoveryGuard\.assertWritable\('app_state'\)/);
+
+  const sync = html.slice(
+    html.indexOf('async function syncFromServiceWorkerState'),
+    html.indexOf('async function bootApp()')
+  );
+  assert.match(sync, /if\s*\(appStateRecoveryGuard\.frozen\)\s*return false/);
+
+  const boot = html.slice(html.indexOf('async function bootApp()'), html.indexOf('bootApp();'));
+  const recovery = boot.indexOf('await prepareAppStateRecovery()');
+  assert.ok(recovery >= 0, 'boot must resolve recovery before native side effects');
+  for (const sideEffect of [
+    'startNativeReplyPolling();',
+    'ensureNativeExecutionCompletedListener()',
+    'syncFromServiceWorkerState(',
+    'startProactiveLoop();',
+    'mirrorAppStateNow()'
+  ]) {
+    assert.ok(recovery < boot.indexOf(sideEffect), `recovery gate must precede ${sideEffect}`);
+  }
+  assert.match(boot, /if\s*\(recoveryDecision\.frozen\)\s*\{[\s\S]*renderAppStateRecoveryBlocker/);
+});

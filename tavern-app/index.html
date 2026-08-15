@@ -963,15 +963,29 @@ button.cell:active{background:#ececec}
 <script src="./lib/role-plan-repository.js"></script>
 <script src="./lib/live-chat-director.js"></script>
 <script src="./lib/yuqi-core-preset.js"></script>
+<script src="./lib/app-state-recovery.js"></script>
 <script>
+const AppStateRecovery = window.ALAppStateRecovery;
+if (!AppStateRecovery) throw new Error('APP_STATE_RECOVERY_MODULE_MISSING');
+const appStateRecoveryGuard = AppStateRecovery.createWriteGuard();
+const APP_STATE_CRITICAL_KEYS = new Set(['settings', 'characters', 'chats', 'moments']);
+const appStateRecoverySlots = new Map();
 const DB = {
-  get(k, def = null) { try { const v = localStorage.getItem('rpchat_' + k) ?? localStorage.getItem('tavern_' + k); return v ? JSON.parse(v) : def } catch { return def } },
+  get(k, def = null) {
+    const result = AppStateRecovery.readStorageSlot(localStorage, 'rpchat_' + k, 'tavern_' + k);
+    if (APP_STATE_CRITICAL_KEYS.has(k)) appStateRecoverySlots.set(k, result);
+    return result.status === 'valid' ? result.value : def;
+  },
   set(k, v) {
+    appStateRecoveryGuard.assertWritable(k);
     localStorage.setItem('rpchat_' + k, JSON.stringify(v));
     localStorage.setItem('rpchat_app_state_updated_at', String(Date.now()));
     if (typeof mirrorAppState === 'function') mirrorAppState().catch(err => console.warn('[AL State] mirror skipped:', err.message));
   },
-  del(k) { localStorage.removeItem('rpchat_' + k) }
+  del(k) {
+    appStateRecoveryGuard.assertWritable(k);
+    localStorage.removeItem('rpchat_' + k);
+  }
 };
 
 const EMOJI_CATEGORIES = [
@@ -5075,6 +5089,7 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
   }
 }
 async function mirrorAppStateNow() {
+  appStateRecoveryGuard.assertWritable('app_state');
   if (typeof MemoryDB === 'undefined') return;
   const updatedAt = Number(localStorage.getItem('rpchat_app_state_updated_at')) || Date.now();
   const mirroredChats = isNativeApp()
@@ -13673,7 +13688,95 @@ async function clearAllHistory() {
   toast(failures.length ? `部分角色清除失败（${failures.length} 个），失败角色数据已保留` : (warnings ? '已清空，部分本地缓存清理待重试' : '已清空'));
 }
 
+function appStateRecoveryLocalEvidence() {
+  const slots = [...appStateRecoverySlots.values()];
+  return {
+    settings,
+    characters,
+    allChats,
+    allMoments,
+    updatedAt: Number(localStorage.getItem('rpchat_app_state_updated_at')) || 0,
+    invalidCritical: slots.some(slot => slot?.status === 'invalid'),
+    source: slots.some(slot => slot?.source === 'legacy') ? 'legacy' : 'primary'
+  };
+}
+
+async function readExistingAppStateMirrorForRecovery() {
+  if (typeof indexedDB === 'undefined' || typeof indexedDB.databases !== 'function') {
+    return { unavailable: true };
+  }
+  const databases = await indexedDB.databases();
+  if (!databases.some(row => row?.name === MEMORY_DB_NAME)) return null;
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(MEMORY_DB_NAME);
+    request.onerror = () => reject(request.error || new Error('APP_STATE_MIRROR_OPEN_FAILED'));
+    request.onsuccess = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains('meta')) {
+        db.close();
+        resolve(null);
+        return;
+      }
+      const transaction = db.transaction('meta', 'readonly');
+      const get = transaction.objectStore('meta').get('app_state');
+      get.onerror = () => reject(get.error || new Error('APP_STATE_MIRROR_READ_FAILED'));
+      get.onsuccess = () => resolve(get.result?.value || null);
+      transaction.oncomplete = () => db.close();
+      transaction.onabort = () => db.close();
+    };
+  });
+}
+
+async function inspectNativeAppRecoveryState() {
+  if (!isNativeApp()) return { roleCount: 0 };
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.inspectAppRecoveryState) return { unavailable: true };
+  try {
+    const result = await plugin.inspectAppRecoveryState();
+    return result && typeof result === 'object' ? result : { unavailable: true };
+  } catch (error) {
+    console.warn('[AL Recovery] native census unavailable:', error?.message || error);
+    return { unavailable: true };
+  }
+}
+
+async function prepareAppStateRecovery() {
+  const local = appStateRecoveryLocalEvidence();
+  let mirror = null;
+  try {
+    mirror = await readExistingAppStateMirrorForRecovery();
+  } catch (error) {
+    console.warn('[AL Recovery] mirror census unavailable:', error?.message || error);
+    mirror = { unavailable: true };
+  }
+  const native = await inspectNativeAppRecoveryState();
+  const recoveryDecision = AppStateRecovery.decideRecovery({ local, mirror: mirror || {}, native });
+  recoveryDecision.local = local;
+  recoveryDecision.mirror = mirror;
+  recoveryDecision.native = native;
+  appStateRecoveryGuard.applyDecision(recoveryDecision);
+  return recoveryDecision;
+}
+
+function renderAppStateRecoveryBlocker(recoveryDecision) {
+  const app = document.getElementById('app') || document.body;
+  let blocker = document.getElementById('app-state-recovery-blocker');
+  if (!blocker) {
+    blocker = document.createElement('section');
+    blocker.id = 'app-state-recovery-blocker';
+    blocker.setAttribute('role', 'alert');
+    blocker.style.cssText = 'position:absolute;inset:0;z-index:10000;background:#faf8f3;padding:calc(var(--safe-top) + 40px) 24px 40px;overflow:auto;color:#222';
+    app.appendChild(blocker);
+  }
+  const roleCount = Number(recoveryDecision?.native?.roleCount) || 0;
+  blocker.innerHTML = `<h1 style="font-size:22px;margin:0 0 18px">手机数据保护模式</h1>
+    <p style="line-height:1.8;margin:0 0 14px">检测到网页角色目录未能安全读取，已暂停所有写入。</p>
+    <p style="line-height:1.8;margin:0;color:#666">原生角色证据：${roleCount} 个<br>原因：${String(recoveryDecision?.reasonCode || 'UNKNOWN')}</p>
+    <p style="line-height:1.8;margin:18px 0 0;color:#666">请勿清除存储、卸载、新建角色或导入备份。</p>`;
+}
+
 async function syncFromServiceWorkerState(options = {}) {
+  if (appStateRecoveryGuard.frozen) return false;
   const mirrorChanged = await restoreAppStateFromMirror();
   const roleDeleteChanged = await restorePendingRoleDeletions().catch(err => {
     console.warn('[AL Native] role deletion status reconcile skipped:', err.message);
@@ -13699,6 +13802,11 @@ async function syncFromServiceWorkerState(options = {}) {
 }
 async function bootApp() {
   refreshAppVersionDisplay();
+  const recoveryDecision = await prepareAppStateRecovery();
+  if (recoveryDecision.frozen) {
+    renderAppStateRecoveryBlocker(recoveryDecision);
+    return;
+  }
   const native = isNativeApp();
   if (native) {
     // Critical native execution wake-up paths must not wait behind optional
