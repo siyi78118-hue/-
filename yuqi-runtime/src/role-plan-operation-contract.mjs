@@ -145,12 +145,13 @@ function validateOperation(operation, allowedPlanIds, validMessageIds) {
     conflict('operation is unknown');
   }
   if (operation.op === 'create') {
-    if (!Object.hasOwn(operation, 'timeConfidence')) conflict('time confidence is invalid');
+    if (!Object.hasOwn(operation, 'timeConfidence')
+      || typeof operation.timeConfidence !== 'string'
+      || !TIME_CONFIDENCE.has(operation.timeConfidence)) {
+      conflict('time confidence is invalid for role plan create');
+    }
     exactKeys(operation, CREATE_ALLOWED, CREATE_REQUIRED, 'create');
     validateSemanticFields(operation, validMessageIds);
-    if (typeof operation.timeConfidence !== 'string' || !TIME_CONFIDENCE.has(operation.timeConfidence)) {
-      conflict('time confidence is invalid');
-    }
     if (operation.type === 'role_schedule'
       && (!Number.isSafeInteger(operation.durationMs) || operation.durationMs < 60_000)) {
       conflict('role schedule duration is invalid');
@@ -162,7 +163,7 @@ function validateOperation(operation, allowedPlanIds, validMessageIds) {
   exactKeys(operation, allowed, required, operation.op === 'update' ? 'update' : 'target operation');
   text(operation.planId, 'plan identity', 96);
   if (allowedPlanIds !== null && !new Set(allowedPlanIds).has(operation.planId)) {
-    conflict('target is not authorized');
+    conflict('role plan target is not authorized');
   }
   optionalText(operation, 'reason', 'reason', 240);
   if (operation.op !== 'update') return;
@@ -192,7 +193,7 @@ export function normalizeRolePlanOperationList(value, {
     try {
       parsed = JSON.parse(value);
     } catch {
-      conflict('JSON is invalid');
+      conflict('rolePlanOperationsJson JSON is invalid');
     }
   }
   if (!Array.isArray(parsed)) conflict('list is invalid');

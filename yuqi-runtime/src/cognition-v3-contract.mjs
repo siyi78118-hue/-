@@ -3,6 +3,7 @@ import {
   COGNITION_SCHEMA_V3,
   EXPRESSION_SCHEMA_V3
 } from './role-schemas.mjs';
+import { normalizeRolePlanOperationList } from './role-plan-operation-contract.mjs';
 
 function clone(value) {
   return structuredClone(value);
@@ -149,30 +150,10 @@ function validateMoment(moment, context) {
 
 function validateRolePlan(rolePlan, context, validMessageIds) {
   if (!rolePlan) return;
-  let operations;
-  try {
-    operations = JSON.parse(rolePlan.operationsJson);
-  } catch {
-    throw new Error('rolePlan operationsJson must be a valid JSON array');
-  }
-  if (!Array.isArray(operations)) {
-    throw new Error('rolePlan operationsJson must be a valid JSON array');
-  }
-  const allowedOps = new Set(['create', 'update', 'cancel', 'pause', 'resume', 'complete']);
-  const allowedPlanIds = asSet(context?.allowedActionTargets?.rolePlanIds);
-  for (const operation of operations) {
-    if (!operation || typeof operation !== 'object' || !allowedOps.has(String(operation.op))) {
-      throw new Error('rolePlan operation is outside the existing domain');
-    }
-    if (operation.op !== 'create' && !allowedPlanIds.has(String(operation.planId))) {
-      throw new Error('rolePlan target is not authorized');
-    }
-    for (const id of operation.evidenceMessageIds || []) {
-      if (!validMessageIds.has(String(id))) {
-        throw new Error(`unknown evidence messageId: ${id}`);
-      }
-    }
-  }
+  normalizeRolePlanOperationList(rolePlan.operationsJson, {
+    allowedPlanIds: context?.allowedActionTargets?.rolePlanIds || [],
+    validMessageIds
+  });
 }
 
 function validateLifeAdjustment(adjustment, context) {

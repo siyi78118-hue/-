@@ -216,6 +216,35 @@ test('structured actions require both an allowed action and the authoritative ta
   );
 });
 
+test('cognition v3 rejects a time-bearing role plan before expression when time confidence is missing', () => {
+  const operation = {
+    op: 'create',
+    type: 'private_message',
+    source: 'spoken',
+    title: '早安',
+    intent: '明早问候',
+    sourceQuote: '但是明天的早安不要忘了',
+    evidenceMessageIds: ['u1'],
+    schedule: { kind: 'once', at: '2026-08-15T08:00:00+08:00' }
+  };
+  const broken = validCognitionV3();
+  broken.actionIntent.rolePlan = { operationsJson: JSON.stringify([operation]) };
+  const context = validationContext({ allowedActions: ['rolePlan'] });
+  assert.throws(
+    () => normalizeCognitionV3Result(broken, context),
+    /role plan operation contract conflict: time confidence/
+  );
+
+  operation.timeConfidence = 'inferred';
+  const accepted = structuredClone(broken);
+  accepted.actionIntent.rolePlan.operationsJson = JSON.stringify([operation]);
+  const normalized = normalizeCognitionV3Result(accepted, context);
+  assert.equal(
+    normalized.actionIntent.rolePlan.operationsJson,
+    accepted.actionIntent.rolePlan.operationsJson
+  );
+});
+
 test('state patch must carry the same stance decisions as self response', () => {
   const value = validCognitionV3();
   value.statePatch.currentStances = structuredClone(value.statePatch.currentStances);

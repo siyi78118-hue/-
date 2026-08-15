@@ -288,6 +288,33 @@ test('role-plan operations require valid JSON, domain operations and allowed tar
   );
 });
 
+test('cognition v2 rejects a time-bearing role plan before expression when time confidence is missing', () => {
+  const broken = validCognition();
+  broken.actionIntent.rolePlanOperationsJson = JSON.stringify([{
+    op: 'create',
+    type: 'private_message',
+    source: 'spoken',
+    title: '早安',
+    intent: '明早问候',
+    sourceQuote: '但是明天的早安不要忘了',
+    evidenceMessageIds: ['msg_user_1'],
+    schedule: { kind: 'once', at: '2026-08-15T08:00:00+08:00' }
+  }]);
+  assert.throws(
+    () => normalizeCognitionResult(broken, validationContext),
+    /role plan operation contract conflict: time confidence/
+  );
+
+  const accepted = structuredClone(broken);
+  accepted.actionIntent.rolePlanOperationsJson = accepted.actionIntent.rolePlanOperationsJson
+    .replace('"schedule"', '"timeConfidence":"inferred","schedule"');
+  const normalized = normalizeCognitionResult(accepted, validationContext);
+  assert.equal(
+    normalized.actionIntent.rolePlanOperationsJson,
+    accepted.actionIntent.rolePlanOperationsJson
+  );
+});
+
 test('base and phase reviews remain separate strict objects', () => {
   const invalid = validCognition();
   invalid.relationshipStageReview.base.phase = 'repairing';

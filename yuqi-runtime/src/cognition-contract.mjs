@@ -3,6 +3,7 @@ import {
   COGNITION_SCHEMA_V2,
   EXPRESSION_SCHEMA_V2
 } from './role-schemas.mjs';
+import { normalizeRolePlanOperationList } from './role-plan-operation-contract.mjs';
 
 function clone(value) {
   return structuredClone(value);
@@ -155,54 +156,10 @@ function nextRolePlanOccurrence(schedule, now) {
 }
 
 function parseRolePlanOperations(text, configured, envelope, validIds) {
-  let operations;
-  try {
-    operations = JSON.parse(text);
-  } catch {
-    throw new Error('rolePlanOperationsJson must be a valid JSON array');
-  }
-  if (!Array.isArray(operations)) {
-    throw new Error('rolePlanOperationsJson must be a valid JSON array');
-  }
-  const allowedOps = new Set(['create', 'update', 'cancel', 'pause', 'resume', 'complete']);
-  const allowedTypes = new Set(['private_message', 'moment_post', 'role_schedule']);
-  const allowedSources = new Set(['spoken', 'accepted_request', 'private_decision', 'user_created']);
-  const allowedPlanIds = asSet(configured?.rolePlanIds);
-  for (const operation of operations) {
-    if (!operation || typeof operation !== 'object' || Array.isArray(operation)) {
-      throw new Error('role plan operation must be an object');
-    }
-    if (!allowedOps.has(String(operation.op || ''))) {
-      throw new Error('role plan operation is outside the existing domain');
-    }
-    if (operation.op === 'create') {
-      if (
-        !allowedTypes.has(String(operation.type || ''))
-        || !allowedSources.has(String(operation.source || ''))
-        || !nextRolePlanOccurrence(operation.schedule, Number(envelope?.createdAt || 0))
-        || (
-          operation.type === 'role_schedule'
-          && (!Number.isFinite(Number(operation.durationMs)) || Number(operation.durationMs) < 60_000)
-        )
-      ) {
-        throw new Error('role plan create operation is outside the existing domain');
-      }
-    }
-    if (operation.op !== 'create' && !allowedPlanIds.has(String(operation.planId || ''))) {
-      throw new Error('role plan target is not authorized');
-    }
-    if (operation.op === 'update' && operation.patch !== undefined && (
-      !operation.patch || typeof operation.patch !== 'object' || Array.isArray(operation.patch)
-    )) {
-      throw new Error('role plan update patch is outside the existing domain');
-    }
-    for (const evidenceId of Array.isArray(operation.evidenceMessageIds)
-      ? operation.evidenceMessageIds.map(String)
-      : []) {
-      if (!validIds.has(evidenceId)) throw new Error(`unknown evidence messageId: ${evidenceId}`);
-    }
-  }
-  return operations;
+  return normalizeRolePlanOperationList(text, {
+    allowedPlanIds: configured?.rolePlanIds || [],
+    validMessageIds: validIds
+  });
 }
 
 function validateLifeAdjustment(adjustment, configured) {
