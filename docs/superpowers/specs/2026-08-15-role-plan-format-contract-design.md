@@ -54,8 +54,10 @@ store 仍保留独立的最终持久化不变量，形成前置合同与落库�
 
 ## 生成端修复
 
-- 主预设明确写出 `timeConfidence` 的两个且仅有两个值，以及显式/推断时间的选择规则。
-- supervisor 也检查安排动作是否满足同一合同，不能批准缺字段的草稿。
+- 每一轮 brain/cognition/supervisor 请求都注入同一个 code-owned 角色安排输出合同，明确写出
+  `timeConfidence` 的两个且仅有两个值，以及显式/推断时间的选择规则；不能只依赖某个预设版本
+  恰好写对说明。
+- supervisor 读取同一 code-owned 合同并检查安排动作，不能批准缺字段的草稿。
 - legacy release 的结构化输出重试把共享合同错误视为协议格式错误，使用现有有限重试重新生成；
   不增加无限循环或新的第五次模型调用。
 - cognition-v2/v3 在 cognition 结果形成后立即调用共享合同；不再等到 visible commit 才发现格式问题。
@@ -65,6 +67,8 @@ store 仍保留独立的最终持久化不变量，形成前置合同与落库�
 - 不把缺失 `timeConfidence` 静默猜成 `inferred`，因为这会把明确时间错误降级为推断时间并改变
   用户确认语义。
 - 不接受 `approximate`、`implicit`、大小写变体等别名；生产者必须经新版提示/有限修复输出规范值。
+- 已注册的旧预设版本及其 checksum 不修改；否则重启会触发 preset seed conflict。新版合同由运行时
+  请求注入，未来发布新预设时再将同样说明固化进新版本文件。
 - 旧数据库中已经提交的 authority-v0 结果不重写；历史恢复继续走原路径。
 - 尚未提交的新版 turn 恢复时重新经过相同共享合同，不能使用旧进程留下的半合法草稿绕过。
 
@@ -91,4 +95,3 @@ store 仍保留独立的最终持久化不变量，形成前置合同与落库�
 - 同一坏格式不得先通过 cognition、后在 orchestrator/store 才失败。
 - v1/v2 authority-v0 快照不变；canonical v3 的 store/bridge/Android 合同继续严格。
 - focused tests、完整 Node 测试、Android JVM/编译门通过；有设备时补 connected instrumentation 门。
-
