@@ -141,7 +141,7 @@ assert.match(script, /max_tokens:\s*normalizedChatMaxTokens\(settings\.maxTokens
 const nativeQueueBody = html.match(/async function queueAndroidUserReply\([\s\S]*?\n}\nasync function mirrorAppStateNow/)?.[0] || '';
 assert.doesNotMatch(nativeQueueBody, /nativeBackgroundRunner\(|AlReplyQueue|dispatchEvent\(/, 'native user replies must not fork into the legacy runner queue');
 assert.match(nativeQueueBody, /buildNativeExecutionSnapshot\(/, 'native user replies should carry an immutable execution snapshot');
-assert.match(html, /async function retryFailedReply[\s\S]{0,1200}nativeRetryTurnIdForMessage\([\s\S]{0,5000}plugin\.submitTurn\(/, 'native retry must create a fresh Room turn');
+assert.match(html, /async function retryFailedReply[\s\S]{0,1800}buildNativeManualResendBatch\([\s\S]{0,2200}nativeTurnIdForMessage\(resendBatch\.sourceMessageId\)[\s\S]{0,5000}plugin\.submitTurn\(/, 'native retry must create a fresh canonical message root and Room turn');
 assert.doesNotMatch(html.match(/async function retryFailedReply[\s\S]*?function showReplyFailureReason/)?.[0] || '', /plugin\.retryTurn\(/, 'manual retry must not reuse a terminal Room turn');
 assert.match(html, /function abortPendingReply[\s\S]{0,1800}plugin\.cancelTurn\(/, 'retract and delete should cancel the native turn');
 assert.match(html, /function expireStalePendingReply[\s\S]{0,500}pending\.nativeTurnId[\s\S]{0,120}return false/, 'web timeout must not override an authoritative native turn');
@@ -1106,7 +1106,7 @@ assert.match(script, /function batchMessageForAI\(charId, message\)/, '原生首
 assert.match(script, /function messageQuoteForWire\(charId, quote\)/, '原生引用必须通过单一闭集投影转换为 v3 wire 结构');
 assert.doesNotMatch(script, /quote:\s*message\?\.quote \|\| null/, '无引用时不能把 quote:null 发给 v3 协议');
 assert.match(script, /message:\s*wireSourceMessage/, '原生首次发送必须以批次末条作为回复锚点');
-assert.match(script, /message:\s*batchMessageForAI\(charId, message\)/, '原生重试必须复用首次发送的规范消息投影');
+assert.match(script, /message:\s*resendBatch\.sourceMessage/, '原生重发必须以全新批次末条作为规范消息投影');
 const plainWireMessage = JSON.parse(JSON.stringify(context.batchMessageForAI('yuqi', {
   id: 'msg_plain_wire', role: 'user', content: '普通消息', time: 30
 })));

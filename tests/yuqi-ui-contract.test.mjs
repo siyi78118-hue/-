@@ -287,29 +287,60 @@ test('native relationship writeback applies base and phase actions atomically', 
   assert.match(html, /熟悉 · 闹矛盾期/);
 });
 
-test('native retry creates a fresh execution turn for the canonical message', () => {
+test('native manual resend creates a fresh canonical message root without claiming a forbidden retry', () => {
   const retry = html.slice(html.indexOf('async function retryFailedReply'), html.indexOf('function showReplyFailureReason'));
   assert.match(retry, /const\s+task\s*=\s*buildAndroidUserReplyTask/);
   assert.match(retry, /const\s+snapshot\s*=\s*await\s+buildNativeExecutionSnapshot\(charId,\s*task\)/);
-  assert.match(retry, /const\s+retryOfTurnId\s*=/);
-  assert.match(retry, /nativeRetryTurnIdForMessage\(userMessageId\)/);
-  assert.match(retry, /plugin\.submitTurn\(\{[\s\S]*?turnId[\s\S]*?inputJson:[\s\S]*?retryOfTurnId[\s\S]*?canonicalMessageId:\s*userMessageId[\s\S]*?snapshotJson:\s*JSON\.stringify\(snapshot\)/);
+  assert.match(retry, /buildNativeManualResendBatch\(/);
+  assert.match(retry, /oldPending\?\.nativeSourceMessageId\s*\|\|\s*userMessageId/);
+  assert.match(retry, /oldPending\?\.nativeMessageIdAliases\s*\|\|\s*\{\}/);
+  assert.match(retry, /Object\.values\(resendBatch\.messageIdAliases\)/);
+  assert.match(retry, /syncYuqiVisibleHistory\(charId,\s*resendHistoryExclusions\)/);
+  assert.match(retry, /nativeSourceMessageId:\s*resendBatch\.sourceMessageId/);
+  assert.match(retry, /plugin\.submitTurn\(\{[\s\S]*?turnId[\s\S]*?sourceMessageId:\s*resendBatch\.sourceMessageId[\s\S]*?inputJson:[\s\S]*?message:\s*resendBatch\.sourceMessage[\s\S]*?snapshotJson:\s*JSON\.stringify\(snapshot\)/);
+  assert.doesNotMatch(retry, /retryOfTurnId|canonicalMessageId/);
   assert.doesNotMatch(retry, /plugin\.retryTurn/);
 });
 
-test('every manual retry anchors to the original deterministic message turn', () => {
+test('manual resend reidentifies the complete batch under one fresh deterministic root', () => {
   const helpersStart = html.indexOf('function nativeTurnIdForMessage');
   const helpersEnd = html.indexOf('async function saveNativeExecutionApiConfigs');
-  const retry = html.slice(html.indexOf('async function retryFailedReply'), html.indexOf('function showReplyFailureReason'));
   assert.ok(helpersStart >= 0 && helpersEnd > helpersStart);
   const helpers = new Function(
     `${html.slice(helpersStart, helpersEnd)}
-     return { nativeTurnIdForMessage, nativeRetryRootTurnId };`
+     return { nativeTurnIdForMessage, buildNativeManualResendBatch };`
   )();
+  const resend = helpers.buildNativeManualResendBatch([
+    { messageId: 'msg_phone_1', content: '第一泡', sentAt: 10, attachments: [] },
+    { messageId: 'msg_phone_2', content: '第二泡', sentAt: 11, attachments: [{ kind: 'image', checksum: 'a' }] }
+  ], 'msg_phone_2', 1000, 'fixed_token');
+  assert.equal(resend.batchId, 'batch_resend_fixed_token');
+  assert.equal(resend.messages.length, 2);
+  assert.deepEqual(resend.messages.map(row => row.content), ['第一泡', '第二泡']);
+  assert.deepEqual(resend.messages.map(row => row.sentAt), [1000, 1001]);
+  assert.equal(new Set(resend.messageIds).size, 2);
+  assert.ok(resend.messageIds.every(id => id.startsWith('msg_resend_')));
+  assert.ok(!resend.messageIds.includes('msg_phone_1'));
+  assert.ok(!resend.messageIds.includes('msg_phone_2'));
+  assert.equal(resend.sourceMessage.messageId, resend.sourceMessageId);
+  assert.equal(resend.sourceMessage.content, '第二泡');
+  assert.equal(resend.messages[1].attachments[0].checksum, 'a');
+  assert.equal(resend.messages[1].attachments[0].messageId, resend.sourceMessageId);
+  assert.equal(resend.messageIdAliases[resend.sourceMessageId], 'msg_phone_2');
+  assert.equal(resend.messageIdForOriginal.msg_phone_2, resend.sourceMessageId);
+  assert.equal(helpers.nativeTurnIdForMessage(resend.sourceMessageId), `turn_${resend.sourceMessageId}`);
 
-  assert.equal(helpers.nativeRetryRootTurnId('msg_phone_1'), helpers.nativeTurnIdForMessage('msg_phone_1'));
-  assert.match(retry, /const\s+retryOfTurnId\s*=\s*nativeRetry\s*\?\s*nativeRetryRootTurnId\(userMessageId\)\s*:\s*''/);
-  assert.doesNotMatch(retry, /retryOfTurnId\s*=\s*nativeRetry\s*\?\s*\(oldPending\?\.nativeTurnId/);
+  const secondResend = helpers.buildNativeManualResendBatch(
+    resend.messages,
+    resend.sourceMessageId,
+    2000,
+    'second_token',
+    resend.messageIdAliases
+  );
+  assert.equal(secondResend.messages.length, 2);
+  assert.equal(secondResend.messageIdAliases[secondResend.sourceMessageId], 'msg_phone_2');
+  assert.equal(secondResend.messageIdForOriginal.msg_phone_2, secondResend.sourceMessageId);
+  assert.ok(secondResend.messageIds.every(id => !resend.messageIds.includes(id)));
 });
 
 test('Room persists fresh retry turns and only deduplicates an exact turn id', () => {
@@ -335,7 +366,7 @@ test('Room persists fresh retry turns and only deduplicates an exact turn id', (
   assert.doesNotMatch(submit, /dao\.turnBySourceMessage\(submission\.sourceMessageId\)/);
 });
 
-test('native retry is accepted only when Room returns the requested turn id', () => {
+test('native manual resend is accepted only when Room returns its fresh requested turn id', () => {
   const retry = html.slice(html.indexOf('async function retryFailedReply'), html.indexOf('function showReplyFailureReason'));
   assert.match(retry, /String\(result\?\.turnId\s*\|\|\s*''\)\s*!==\s*turnId/);
   assert.match(retry, /throw new Error\(/);
@@ -343,6 +374,21 @@ test('native retry is accepted only when Room returns the requested turn id', ()
     retry.indexOf("String(result?.turnId || '') !== turnId") < retry.indexOf('nativeAcceptedAt'),
     'a mismatched native turn must be rejected before the retry is marked accepted'
   );
+});
+
+test('native manual resend maps the fresh wire source back to the original visible bubble', () => {
+  const apply = html.slice(
+    html.indexOf('function nativeResultDisplaySourceMessageId'),
+    html.indexOf('async function applyNativeExecutionTurnUnlocked')
+  );
+  const unlocked = html.slice(
+    html.indexOf('async function applyNativeExecutionTurnUnlocked'),
+    html.indexOf('function applyNativeExecutionTurn(result)')
+  );
+  assert.match(apply, /pending\?\.nativeSourceMessageId\s*===\s*sourceMessageId/);
+  assert.match(apply, /return\s+String\(pending\.userMessageId\)/);
+  assert.match(unlocked, /nativeResultDisplaySourceMessageId\(chat,\s*result\)/);
+  assert.match(unlocked, /messageById\(chat,\s*displaySourceMessageId\)/);
 });
 
 test('Android chat clear is native-first and does not use the desktop localStorage path', () => {
@@ -1081,7 +1127,7 @@ test('native polling ignores elapsed-counter-only changes', () => {
   };
   assert.equal(nativePendingStateIsCurrent(chat, { replyState: 'pending' }, result), true);
   const apply = html.slice(
-    html.indexOf('const userMessage = messageById(chat, result?.sourceMessageId)'),
+    html.indexOf('const displaySourceMessageId = nativeResultDisplaySourceMessageId(chat, result);', html.indexOf('async function applyNativeExecutionTurnUnlocked')),
     html.indexOf('function applyNativeExecutionTurn(result)')
   );
   const currentCheckAt = apply.indexOf('nativePendingStateIsCurrent(chat, userMessage, result)');
@@ -1446,7 +1492,7 @@ test('canonical action validation is closed before any legacy writer and rejects
   const makeApply = new Function(
     'allChats', 'nativeDirectTurnIsSuperseded', 'nativeReplyQueuedIds', 'nativeTerminalDispositionLanding',
     'nativeStructuredActionParts', 'applyAndVerifyNativeStructuredParts', 'applyNativeRelationshipStagePart',
-    'messageById',
+    'messageById', 'nativeResultDisplaySourceMessageId',
     `${applySource}; return applyNativeExecutionTurnUnlocked;`
   );
   let relationshipWrites = 0;
@@ -1458,7 +1504,8 @@ test('canonical action validation is closed before any legacy writer and rejects
     (_result, parts) => parts.filter(part => part?.type !== 'TEXT'),
     async () => false,
     () => { relationshipWrites += 1; return true; },
-    chat => chat.messages[0]
+    chat => chat.messages[0],
+    (_chat, result) => result.sourceMessageId
   );
   const failedCanonicalResult = {
     characterId: 'yuqi', kind: 'DIRECT_REPLY', state: 'COMPLETED', terminalDisposition: 'visible',

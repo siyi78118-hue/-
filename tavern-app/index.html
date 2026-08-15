@@ -2847,12 +2847,52 @@ function withOptionalTemperature(payload, enabled, value) {
 function nativeTurnIdForMessage(messageId) {
   return `turn_${String(messageId || '').replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 }
-function nativeRetryRootTurnId(messageId) {
-  return nativeTurnIdForMessage(messageId);
+function nativeManualResendToken(now = Date.now()) {
+  return `${Math.max(1, Number(now) || Date.now()).toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
 }
-function nativeRetryTurnIdForMessage(messageId) {
-  const source = String(messageId || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(-48);
-  return `turn_retry_${source}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+function buildNativeManualResendBatch(batchMessages, originalSourceMessageId, createdAt = Date.now(), requestedToken = '', previousAliases = {}) {
+  const sourceRows = Array.isArray(batchMessages) ? batchMessages.filter(row => row && typeof row === 'object') : [];
+  const originalSource = String(originalSourceMessageId || '');
+  const sourceMatches = sourceRows.reduce((count, row) => count + (String(row.messageId || '') === originalSource ? 1 : 0), 0);
+  if (!sourceRows.length || sourceMatches !== 1 || String(sourceRows.at(-1)?.messageId || '') !== originalSource) {
+    throw new Error('无法重建原消息批次，请返回聊天页后重新发送');
+  }
+  const token = String(requestedToken || nativeManualResendToken(createdAt)).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+  if (!token) throw new Error('无法生成新的发送身份');
+  const startedAt = Math.max(1, Number(createdAt) || Date.now());
+  const messages = sourceRows.map((row, ordinal) => {
+    const originalId = String(row.messageId || 'message').replace(/[^a-zA-Z0-9_-]/g, '_').slice(-32);
+    const messageId = `msg_resend_${originalId}_${token}_${ordinal + 1}`;
+    const attachments = Array.isArray(row.attachments)
+      ? row.attachments.map((attachment, attachmentOrdinal) => ({
+          ...attachment,
+          attachmentId: `att_resend_${token}_${ordinal + 1}_${attachmentOrdinal + 1}`,
+          messageId
+        }))
+      : undefined;
+    const payment = row.payment && typeof row.payment === 'object'
+      ? { ...row.payment, messageId }
+      : undefined;
+    return {
+      ...row,
+      messageId,
+      sentAt: startedAt + ordinal,
+      ...(attachments ? { attachments } : {}),
+      ...(payment ? { payment } : {})
+    };
+  });
+  const displayMessageId = row => String(previousAliases?.[String(row.messageId || '')] || row.messageId || '');
+  const messageIdForOriginal = Object.fromEntries(sourceRows.map((row, index) => [displayMessageId(row), messages[index].messageId]));
+  const messageIdAliases = Object.fromEntries(sourceRows.map((row, index) => [messages[index].messageId, displayMessageId(row)]));
+  return {
+    batchId: `batch_resend_${token}`,
+    messageIds: messages.map(row => row.messageId),
+    messages,
+    messageIdForOriginal,
+    messageIdAliases,
+    sourceMessageId: messages.at(-1).messageId,
+    sourceMessage: messages.at(-1)
+  };
 }
 async function saveNativeExecutionApiConfigs() {
   const plugin = nativeExecutionPlugin();
@@ -4224,7 +4264,7 @@ function nativeActionAlreadyPersisted(charId, part, result) {
     );
   }
   if (part.type === 'PAYMENT_STATUS') {
-    const targetId = String(canonical.action.targetKey || '').replace(/^payment:/, '');
+    const targetId = nativeResultDisplayMessageId(allChats[charId], String(canonical.action.targetKey || '').replace(/^payment:/, ''));
     const payment = typeof latestPendingPayment === 'function' ? latestPendingPayment(allChats[charId], targetId) : null;
     const expected = canonical.action.kind === 'payment_accept' ? 'received' : 'refused';
     return !!payment
@@ -4291,7 +4331,7 @@ function nativeCanonicalActionTargetAvailable(charId, chat, part, result, canoni
   const payload = action.payload && typeof action.payload === 'object' && !Array.isArray(action.payload)
     ? action.payload : {};
   if (action.kind === 'payment_accept' || action.kind === 'payment_decline') {
-    const paymentId = String(action.targetKey || '').replace(/^payment:/, '');
+    const paymentId = nativeResultDisplayMessageId(chat, String(action.targetKey || '').replace(/^payment:/, ''));
     return !!(typeof latestPendingPayment === 'function' && latestPendingPayment(chat, paymentId));
   }
   if (action.kind === 'relationship_transition') {
@@ -4347,7 +4387,7 @@ async function applyAndVerifyNativeStructuredParts(charId, chat, result, parts, 
     const payload = canonical.legacyPayload;
     let applied = false;
     if (part.type === 'PAYMENT_STATUS') {
-      const targetId = String(canonical.action.targetKey || '').replace(/^payment:/, '');
+      const targetId = nativeResultDisplayMessageId(chat, String(canonical.action.targetKey || '').replace(/^payment:/, ''));
       const expected = canonical.action.kind === 'payment_accept' ? 'received' : 'refused';
       const payment = typeof latestPendingPayment === 'function' ? latestPendingPayment(chat, targetId) : null;
       if (payment) {
@@ -4403,9 +4443,21 @@ function nativePendingRetryLineage(pending) {
   ].filter(Boolean).map(String))];
 }
 
+function nativeResultDisplaySourceMessageId(chat, result) {
+  const sourceMessageId = String(result?.sourceMessageId || '');
+  const pending = chat?.pendingReply;
+  if (pending?.nativeSourceMessageId === sourceMessageId && pending?.userMessageId) return String(pending.userMessageId);
+  return String(pending?.nativeMessageIdAliases?.[sourceMessageId] || sourceMessageId);
+}
+
+function nativeResultDisplayMessageId(chat, wireMessageId) {
+  const messageId = String(wireMessageId || '');
+  return String(chat?.pendingReply?.nativeMessageIdAliases?.[messageId] || messageId);
+}
+
 function nativeDirectTurnIsSuperseded(chat, result) {
   if (String(result?.kind || 'DIRECT_REPLY') !== 'DIRECT_REPLY') return false;
-  const sourceMessageId = String(result?.sourceMessageId || '');
+  const sourceMessageId = nativeResultDisplaySourceMessageId(chat, result);
   const resultTurnId = String(result?.turnId || '');
   const active = chat?.pendingReply;
   if (
@@ -4432,7 +4484,8 @@ function nativeTerminalDispositionLanding(result, chat, allParts) {
       delete chat.pendingReply;
       changed = true;
     }
-    const sourceMessage = result?.sourceMessageId ? messageById(chat, result.sourceMessageId) : null;
+    const displaySourceMessageId = nativeResultDisplaySourceMessageId(chat, result);
+    const sourceMessage = displaySourceMessageId ? messageById(chat, displaySourceMessageId) : null;
     if (sourceMessage && (sourceMessage.replyState || sourceMessage.replyError)) {
       delete sourceMessage.replyState;
       delete sourceMessage.replyError;
@@ -4557,7 +4610,8 @@ async function applyNativeExecutionTurnUnlocked(result) {
     }
     return false;
   }
-  const userMessage = messageById(chat, result?.sourceMessageId);
+  const displaySourceMessageId = nativeResultDisplaySourceMessageId(chat, result);
+  const userMessage = messageById(chat, displaySourceMessageId);
   if (!userMessage) return false;
   if (
     !['COMPLETED', 'FAILED_FINAL', 'INTERRUPTED', 'CANCELLED'].includes(state)
@@ -9163,24 +9217,51 @@ async function retryFailedReply(charId, userMessageId) {
   const previousReplyError = message.replyError;
   const retryStartedAt = Date.now();
   const nativeRetry = isNativeApp();
-  const retryOfTurnId = nativeRetry ? nativeRetryRootTurnId(userMessageId) : '';
-  const retryLineageTurnIds = nativeRetry ? [...new Set([
-    ...(Array.isArray(oldPending?.retryLineageTurnIds) ? oldPending.retryLineageTurnIds : []),
-    retryOfTurnId
-  ].filter(Boolean).map(String))].slice(-20) : [];
-  const turnId = nativeRetry ? nativeRetryTurnIdForMessage(userMessageId) : '';
+  const originalBatchMessages = Array.isArray(savedOptions.batchMessages) && savedOptions.batchMessages.length
+    ? savedOptions.batchMessages
+    : [batchMessageForAI(charId, message)];
+  const priorWireSourceMessageId = String(oldPending?.nativeSourceMessageId || userMessageId);
+  const resendBatch = nativeRetry
+    ? buildNativeManualResendBatch(
+        originalBatchMessages,
+        priorWireSourceMessageId,
+        retryStartedAt,
+        '',
+        oldPending?.nativeMessageIdAliases || {}
+      )
+    : null;
+  const resendOptions = nativeRetry ? {
+    ...savedOptions,
+    batchId: resendBatch.batchId,
+    batchMessageIds: resendBatch.messageIds,
+    batchMessages: resendBatch.messages,
+    batchStartedAt: resendBatch.messages[0].sentAt,
+    batchCommittedAt: resendBatch.messages.at(-1).sentAt
+  } : savedOptions;
+  const turnId = nativeRetry ? nativeTurnIdForMessage(resendBatch.sourceMessageId) : '';
   chat.pendingReply = {
     userMessageId,
     userText: String(oldPending?.userText || message.content || ''),
-    options: savedOptions,
+    options: resendOptions,
+    ...(nativeRetry ? {
+      batchId: resendBatch.batchId,
+      batchMessageIds: [...resendBatch.messageIds],
+      batchStartedAt: resendBatch.messages[0].sentAt,
+      batchCommittedAt: resendBatch.messages.at(-1).sentAt
+    } : {}),
     state: 'pending',
     createdAt: retryStartedAt,
     updatedAt: retryStartedAt,
-    ...(nativeRetry ? { nativeTurnId: turnId, retryOfTurnId, retryLineageTurnIds } : {}),
+    ...(nativeRetry ? {
+      nativeTurnId: turnId,
+      nativeSourceMessageId: resendBatch.sourceMessageId,
+      nativeMessageIdAliases: resendBatch.messageIdAliases
+    } : {}),
     previousReplyState: previousReplyState || 'failed',
     previousReplyError: previousReplyError || ''
   };
   message.replyState = 'pending';
+  if (nativeRetry) message.sourceTurnId = `native:${turnId}`;
   delete message.replyError;
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
@@ -9189,22 +9270,37 @@ async function retryFailedReply(charId, userMessageId) {
     nativeReplyQueuedIds.add(turnId);
     try {
       await saveNativeExecutionApiConfigs();
-      const task = buildAndroidUserReplyTask(charId, userMessageId, chat.pendingReply.userText, savedOptions, chat.pendingReply.createdAt);
+      const resendHistoryExclusions = new Set([
+        ...originalBatchMessages.map(row => String(row.messageId || '')).filter(Boolean),
+        ...Object.values(resendBatch.messageIdAliases).map(String).filter(Boolean)
+      ]);
+      await syncYuqiVisibleHistory(charId, resendHistoryExclusions);
+      const visibilityCursor = await getYuqiVisibilityCursor(charId);
+      const task = buildAndroidUserReplyTask(
+        charId,
+        userMessageId,
+        chat.pendingReply.userText,
+        { ...resendOptions, visibilityCursor },
+        chat.pendingReply.createdAt
+      );
       const snapshot = await buildNativeExecutionSnapshot(charId, task);
+      const wireOptions = { ...task.options };
+      delete wireOptions.attachments;
+      if (wireOptions.paymentMessageId) {
+        const paymentWireId = resendBatch.messageIdForOriginal[String(wireOptions.paymentMessageId)];
+        if (!paymentWireId) throw new Error('无法重建支付消息的发送身份');
+        wireOptions.paymentMessageId = paymentWireId;
+      }
       await assertNativeRoleDeletionAcceptsWork(charId, plugin);
       const result = await plugin.submitTurn({
         turnId,
         characterId: charId,
-        sourceMessageId: userMessageId,
+        sourceMessageId: resendBatch.sourceMessageId,
         kind: 'DIRECT_REPLY',
         inputJson: JSON.stringify({
           userText: task.userText,
-          options: task.options,
-          retry: {
-            retryOfTurnId,
-            canonicalMessageId: userMessageId
-          },
-          message: batchMessageForAI(charId, message),
+          options: wireOptions,
+          message: resendBatch.sourceMessage,
           deviceSeq: Math.max(1, task.createdAt)
         }),
         snapshotJson: JSON.stringify(snapshot),
