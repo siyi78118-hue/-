@@ -16973,6 +16973,27 @@ export class YuqiStore {
       }
       const turn = this.getTurn(turnId);
       if (wireProtocolVersion === 3) {
+        const releasedLane = this.db.prepare(`
+          UPDATE interaction_lanes
+          SET revision = revision + 1, generating_turn_id = NULL, updated_at = ?
+          WHERE role_id = ? AND lane_key = ? AND generating_turn_id = ?
+            AND local_sequence = ?
+        `).run(
+          timestamp,
+          turn.characterId,
+          turn.laneKey,
+          turn.turnId,
+          Number(turn.inputVisibilitySequence)
+        );
+        if (Number(releasedLane.changes) !== 1) {
+          throw new Error('canonical failure lane authority conflict');
+        }
+        this.appendSync(
+          'interaction_lane',
+          `${turn.characterId}:${turn.laneKey}`,
+          'failure_release',
+          this.getInteractionLane(turn.characterId, turn.laneKey)
+        );
         const lineage = this.getTurnAuthorityLineage(turn.authorityLineageKey);
         const authority = projectCanonicalFailureForWire({ turn, lineage, failure: normalizedFailure });
         const recoveryAckSeq = Number(this.db.prepare(
@@ -16999,6 +17020,59 @@ export class YuqiStore {
       }
       this.appendSync('turn', turnId, 'state', turn);
       return turn;
+    });
+  }
+
+  repairTerminalCanonicalV3LaneOwnersInternal({ timestamp = now() } = {}) {
+    return this.withImmediateTransaction(() => {
+      const repairedAt = Number(timestamp);
+      if (!Number.isSafeInteger(repairedAt) || repairedAt <= 0) {
+        throw new Error('canonical failure lane repair timestamp conflict');
+      }
+      const candidates = this.db.prepare(`
+        SELECT l.role_id, l.lane_key, l.revision, l.local_sequence,
+               l.generating_turn_id, t.input_visibility_sequence
+        FROM interaction_lanes l
+        JOIN turns t ON t.turn_id = l.generating_turn_id
+        JOIN turn_authority_lineages a ON a.lineage_key = t.authority_lineage_key
+        WHERE t.result_authority_version = 1
+          AND json_extract(t.envelope_json, '$.protocolVersion') = 3
+          AND t.state = 'failed' AND t.reply_json IS NULL
+          AND a.state = 'open' AND a.latest_turn_id = t.turn_id
+          AND a.committed_group_id IS NULL
+        ORDER BY l.role_id, l.lane_key
+      `).all();
+      let repaired = 0;
+      for (const candidate of candidates) {
+        if (Number(candidate.local_sequence) !== Number(candidate.input_visibility_sequence)) {
+          throw new Error('canonical failure lane authority conflict');
+        }
+        this.loadCanonicalFailureForBridgeInternal(candidate.generating_turn_id);
+        const result = this.db.prepare(`
+          UPDATE interaction_lanes
+          SET revision = revision + 1, generating_turn_id = NULL, updated_at = ?
+          WHERE role_id = ? AND lane_key = ? AND revision = ?
+            AND generating_turn_id = ? AND local_sequence = ?
+        `).run(
+          repairedAt,
+          candidate.role_id,
+          candidate.lane_key,
+          Number(candidate.revision),
+          candidate.generating_turn_id,
+          Number(candidate.local_sequence)
+        );
+        if (Number(result.changes) !== 1) {
+          throw new Error('canonical failure lane authority conflict');
+        }
+        this.appendSync(
+          'interaction_lane',
+          `${candidate.role_id}:${candidate.lane_key}`,
+          'failure_release_repair',
+          this.getInteractionLane(candidate.role_id, candidate.lane_key)
+        );
+        repaired += 1;
+      }
+      return repaired;
     });
   }
 

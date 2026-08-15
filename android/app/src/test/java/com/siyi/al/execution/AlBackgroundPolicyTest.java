@@ -28,6 +28,13 @@ public class AlBackgroundPolicyTest {
     }
 
     @Test
+    public void newerDirectInputOnlySupersedesLegacyRetryRecovery() {
+        assertTrue(AlBackgroundPolicy.skipOlderDirectRetry(false, 100L, 200L));
+        assertFalse(AlBackgroundPolicy.skipOlderDirectRetry(true, 100L, 200L));
+        assertFalse(AlBackgroundPolicy.skipOlderDirectRetry(false, 200L, 200L));
+    }
+
+    @Test
     public void occurrenceIdentifierIsStableAcrossWakeSources() {
         assertEquals("plan-a:1784278800000", RolePlanOccurrenceKey.of("plan-a", 1784278800000L));
         assertEquals(

@@ -907,10 +907,18 @@ test('v3 retries require a terminal persisted retry authorization and reject mal
 test('canonical v3 failure has one closed PC status and a leased null-group outbox target', () => {
   withStore(({ store }) => {
     const parent = createV3(store).result.turn;
+    const claimedLane = store.getInteractionLane(parent.characterId, parent.laneKey);
+    assert.equal(claimedLane.generatingTurnId, parent.turnId);
+    assert.equal(claimedLane.localSequence, parent.inputVisibilitySequence);
     const failed = failV3Retryably(store, parent, {
       name: 'ProviderTimeout',
       message: 'provider temporarily unavailable'
     });
+    const releasedLane = store.getInteractionLane(parent.characterId, parent.laneKey);
+    assert.equal(releasedLane.generatingTurnId, null,
+      'a terminal canonical failure must not leave the conversation lane permanently occupied');
+    assert.equal(releasedLane.localSequence, parent.inputVisibilitySequence,
+      'releasing the failed owner must preserve the accepted input watermark');
     const projected = store.loadCanonicalFailureForBridgeInternal(failed.turnId);
     assert.equal(projected.type, 'BACKLOG_FAILED');
     assert.equal(projected.errorCode, 'YUQI_TRANSIENT_EXECUTION_FAILURE');
@@ -980,6 +988,25 @@ test('canonical wire-v3 failure rejects same-turn requeue without changing autho
       /authorized child retry/
     );
     assert.deepEqual(store.getTurn(failed.turnId), before);
+  });
+});
+
+test('startup repair releases only legacy-stuck terminal v3 lane owners idempotently', () => {
+  withStore(({ store }) => {
+    const failed = failV3Retryably(store, createV3(store).result.turn);
+    const lane = store.getInteractionLane(failed.characterId, failed.laneKey);
+    assert.equal(lane.generatingTurnId, null);
+    store.db.prepare(`
+      UPDATE interaction_lanes
+      SET generating_turn_id = ?, revision = revision + 1
+      WHERE role_id = ? AND lane_key = ?
+    `).run(failed.turnId, failed.characterId, failed.laneKey);
+
+    assert.equal(store.repairTerminalCanonicalV3LaneOwnersInternal({ timestamp: 200_000 }), 1);
+    const repaired = store.getInteractionLane(failed.characterId, failed.laneKey);
+    assert.equal(repaired.generatingTurnId, null);
+    assert.equal(repaired.localSequence, failed.inputVisibilitySequence);
+    assert.equal(store.repairTerminalCanonicalV3LaneOwnersInternal({ timestamp: 200_001 }), 0);
   });
 });
 

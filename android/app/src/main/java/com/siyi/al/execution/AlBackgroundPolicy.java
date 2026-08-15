@@ -12,4 +12,12 @@ public final class AlBackgroundPolicy {
         if (attemptSequence == 3) return 300L;
         return -1L;
     }
+
+    public static boolean skipOlderDirectRetry(
+        boolean storeOwnedV3,
+        long turnCreatedAt,
+        long latestDirectCreatedAt
+    ) {
+        return !storeOwnedV3 && turnCreatedAt < latestDirectCreatedAt;
+    }
 }

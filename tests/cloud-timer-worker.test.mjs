@@ -24,6 +24,7 @@ class MemoryTimerStore {
     this.devices = new Map();
     this.jobs = new Map();
     this.cronSummary = null;
+    this.deliveryProbe = null;
   }
   async getSubscription(deviceId) {
     return this.devices.get(deviceId) || null;
@@ -72,6 +73,12 @@ class MemoryTimerStore {
   }
   async saveCronSummary(summary) {
     this.cronSummary = structuredClone(summary);
+  }
+  async saveDeliveryProbe(probe) {
+    this.deliveryProbe = structuredClone(probe);
+  }
+  async getDeliveryProbe() {
+    return this.deliveryProbe && structuredClone(this.deliveryProbe);
   }
 }
 
@@ -193,6 +200,9 @@ test('cron defers an automatic authority job without writing the legacy timer ta
   assert.equal(deferred.jobId, automatic.jobId);
   assert.equal(deferred.awaitingAck, true);
   assert.ok(deferred.nextAttemptAt > Date.now());
+  assert.equal(store.deliveryProbe?.workerVersion, '2026-08-15.8');
+  assert.equal(store.deliveryProbe?.stage, 'awaiting_phone_ack');
+  assert.equal(store.deliveryProbe?.jobId, automatic.jobId);
   assert.deepEqual(
     {
       owner: sentPayloads[0].owner,
@@ -264,4 +274,253 @@ test('FCM uses the documented Android high priority value and survives short off
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+async function importWorkerWithShortFirebaseDeadline(sourceEdits = value => value, suffix = 'firebase-deadline') {
+  const isolatedSource = sourceEdits(readFileSync('cloud-timer-worker.js', 'utf8'))
+    .replace("from './automatic-schedule-contract.mjs'", `from '${contractUrl}'`)
+    .replace('const FIREBASE_FETCH_TIMEOUT_MS = 10_000;', 'const FIREBASE_FETCH_TIMEOUT_MS = 10;')
+    .replace('const PUSH_SUBSCRIPTION_TIMEOUT_MS = 10_000;', 'const PUSH_SUBSCRIPTION_TIMEOUT_MS = 10;')
+    .replace('const PUSH_DELIVERY_TIMEOUT_MS = 30_000;', 'const PUSH_DELIVERY_TIMEOUT_MS = 100;');
+  return import(`data:text/javascript;base64,${Buffer.from(isolatedSource).toString('base64')}#${suffix}-${Date.now()}`);
+}
+
+async function postTo(workerModule, env, path, body) {
+  return workerModule.default.fetch(new Request(`https://worker.example${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }), env);
+}
+
+async function runWorkerCron(workerModule, env) {
+  const pending = [];
+  await workerModule.default.scheduled({}, env, { waitUntil(promise) { pending.push(promise); } });
+  await Promise.all(pending);
+}
+
+async function registerDueLegacyJob(workerModule, env, jobId) {
+  assert.equal((await postTo(workerModule, env, '/register', {
+    deviceId: 'device-timeout',
+    transport: 'fcm',
+    fcmToken: 'token-timeout',
+    capabilities: { backgroundAck: 1 }
+  })).status, 200);
+  assert.equal((await postTo(workerModule, env, '/schedule', {
+    deviceId: 'device-timeout',
+    charId: 'char-timeout',
+    jobId,
+    kind: 'chat',
+    dueAt: new Date(Date.now() - 61_000).toISOString(),
+    test: true
+  })).status, 200);
+}
+
+function neverReturningFetchThatHonorsAbort() {
+  return async (_url, options = {}) => new Promise((_resolve, reject) => {
+    const signal = options.signal;
+    if (!signal) return;
+    const abort = () => reject(signal.reason || new Error('aborted'));
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+test('a hung Firebase OAuth request times out and enters durable delivery backoff', async () => {
+  const originalFetch = globalThis.fetch;
+  const isolatedWorker = await importWorkerWithShortFirebaseDeadline(
+    source => source.replace(
+      'const assertion = await createFirebaseServiceAccountJWT(env, now);',
+      "const assertion = 'test-assertion';"
+    ).replace(
+      '() => createFirebaseServiceAccountJWT(env, now)',
+      "() => Promise.resolve('test-assertion')"
+    ),
+    'firebase-oauth-timeout'
+  );
+  globalThis.fetch = neverReturningFetchThatHonorsAbort();
+  try {
+    const env = envFor();
+    await registerDueLegacyJob(isolatedWorker, env, 'oauth-timeout-job');
+    const outcome = await Promise.race([
+      runWorkerCron(isolatedWorker, env).then(() => 'completed'),
+      new Promise(resolve => setTimeout(() => resolve('still-hung'), 150))
+    ]);
+    assert.equal(outcome, 'completed');
+    const stored = await env.AL_TIMER_STORE.getJob('oauth-timeout-job');
+    assert.equal(stored.deliveryAttempts, 1);
+    assert.equal(stored.lastDeliveryError, 'firebase oauth timeout');
+    assert.ok(Date.parse(stored.nextDeliveryAttemptAt) > Date.now());
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a hung push subscription lookup times out and enters durable delivery backoff', async () => {
+  const isolatedWorker = await importWorkerWithShortFirebaseDeadline(
+    value => value,
+    'push-subscription-timeout'
+  );
+  const env = envFor();
+  await registerDueLegacyJob(isolatedWorker, env, 'subscription-timeout-job');
+  env.AL_TIMER_STORE.getSubscription = async () => new Promise(() => {});
+  const outcome = await Promise.race([
+    runWorkerCron(isolatedWorker, env).then(() => 'completed'),
+    new Promise(resolve => setTimeout(() => resolve('still-hung'), 150))
+  ]);
+  assert.equal(outcome, 'completed');
+  const stored = await env.AL_TIMER_STORE.getJob('subscription-timeout-job');
+  assert.equal(stored.deliveryAttempts, 1);
+  assert.equal(stored.lastDeliveryError, 'push subscription timeout');
+  assert.ok(Date.parse(stored.nextDeliveryAttemptAt) > Date.now());
+});
+
+test('a hung Firebase JWT signing stage times out and enters durable delivery backoff', async () => {
+  const originalFetch = globalThis.fetch;
+  const isolatedWorker = await importWorkerWithShortFirebaseDeadline(
+    source => source
+      .replace(
+        'const assertion = await createFirebaseServiceAccountJWT(env, now);',
+        'const assertion = await new Promise(() => {});'
+      )
+      .replace(
+        "const assertion = await runFirebaseStageWithTimeout('jwt', () => createFirebaseServiceAccountJWT(env, now));",
+        "const assertion = await runFirebaseStageWithTimeout('jwt', () => new Promise(() => {}));"
+      )
+      .replace(
+        '() => createFirebaseServiceAccountJWT(env, now)',
+        '() => new Promise(() => {})'
+      ),
+    'firebase-jwt-timeout'
+  );
+  globalThis.fetch = async () => {
+    throw new Error('fetch must not run while JWT signing is hung');
+  };
+  try {
+    const env = envFor();
+    await registerDueLegacyJob(isolatedWorker, env, 'jwt-timeout-job');
+    const outcome = await Promise.race([
+      runWorkerCron(isolatedWorker, env).then(() => 'completed'),
+      new Promise(resolve => setTimeout(() => resolve('still-hung'), 150))
+    ]);
+    assert.equal(outcome, 'completed');
+    const stored = await env.AL_TIMER_STORE.getJob('jwt-timeout-job');
+    assert.equal(stored.deliveryAttempts, 1);
+    assert.equal(stored.lastDeliveryError, 'firebase jwt timeout');
+    assert.ok(Date.parse(stored.nextDeliveryAttemptAt) > Date.now());
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a hung Firebase send request times out and enters durable delivery backoff', async () => {
+  const originalFetch = globalThis.fetch;
+  const isolatedWorker = await importWorkerWithShortFirebaseDeadline(
+    source => source.replace(
+      'const accessToken = await getFirebaseAccessToken(env);',
+      "const accessToken = 'test-access-token';"
+    ),
+    'firebase-send-timeout'
+  );
+  globalThis.fetch = neverReturningFetchThatHonorsAbort();
+  try {
+    const env = envFor();
+    await registerDueLegacyJob(isolatedWorker, env, 'send-timeout-job');
+    const outcome = await Promise.race([
+      runWorkerCron(isolatedWorker, env).then(() => 'completed'),
+      new Promise(resolve => setTimeout(() => resolve('still-hung'), 150))
+    ]);
+    assert.equal(outcome, 'completed');
+    const stored = await env.AL_TIMER_STORE.getJob('send-timeout-job');
+    assert.equal(stored.deliveryAttempts, 1);
+    assert.equal(stored.lastDeliveryError, 'firebase send timeout');
+    assert.ok(Date.parse(stored.nextDeliveryAttemptAt) > Date.now());
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a Firebase OAuth response body that never finishes times out and enters durable delivery backoff', async () => {
+  const originalFetch = globalThis.fetch;
+  const isolatedWorker = await importWorkerWithShortFirebaseDeadline(
+    source => source.replace(
+      '() => createFirebaseServiceAccountJWT(env, now)',
+      "() => Promise.resolve('test-assertion')"
+    ),
+    'firebase-oauth-body-timeout'
+  );
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => new Promise(() => {})
+  });
+  try {
+    const env = envFor();
+    await registerDueLegacyJob(isolatedWorker, env, 'oauth-body-timeout-job');
+    const outcome = await Promise.race([
+      runWorkerCron(isolatedWorker, env).then(() => 'completed'),
+      new Promise(resolve => setTimeout(() => resolve('still-hung'), 150))
+    ]);
+    assert.equal(outcome, 'completed');
+    const stored = await env.AL_TIMER_STORE.getJob('oauth-body-timeout-job');
+    assert.equal(stored.deliveryAttempts, 1);
+    assert.equal(stored.lastDeliveryError, 'firebase oauth body timeout');
+    assert.ok(Date.parse(stored.nextDeliveryAttemptAt) > Date.now());
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('an FCM send response body that never finishes times out and enters durable delivery backoff', async () => {
+  const originalFetch = globalThis.fetch;
+  const isolatedWorker = await importWorkerWithShortFirebaseDeadline(
+    source => source.replace(
+      'const accessToken = await getFirebaseAccessToken(env);',
+      "const accessToken = 'test-access-token';"
+    ),
+    'firebase-send-body-timeout'
+  );
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    text: async () => new Promise(() => {})
+  });
+  try {
+    const env = envFor();
+    await registerDueLegacyJob(isolatedWorker, env, 'send-body-timeout-job');
+    const outcome = await Promise.race([
+      runWorkerCron(isolatedWorker, env).then(() => 'completed'),
+      new Promise(resolve => setTimeout(() => resolve('still-hung'), 150))
+    ]);
+    assert.equal(outcome, 'completed');
+    const stored = await env.AL_TIMER_STORE.getJob('send-body-timeout-job');
+    assert.equal(stored.deliveryAttempts, 1);
+    assert.equal(stored.lastDeliveryError, 'firebase send body timeout');
+    assert.ok(Date.parse(stored.nextDeliveryAttemptAt) > Date.now());
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('an unknown hung push transport is stopped by the outer delivery deadline and enters durable backoff', async () => {
+  const isolatedWorker = await importWorkerWithShortFirebaseDeadline(
+    source => source
+      .replace('const PUSH_DELIVERY_TIMEOUT_MS = 30_000;', 'const PUSH_DELIVERY_TIMEOUT_MS = 10;')
+      .replace(
+        'async function sendPush(target, env, payload = {}) {',
+        'async function sendPush(target, env, payload = {}) {\n  return new Promise(() => {});'
+      ),
+    'outer-push-timeout'
+  );
+  const env = envFor();
+  await registerDueLegacyJob(isolatedWorker, env, 'outer-push-timeout-job');
+  const outcome = await Promise.race([
+    runWorkerCron(isolatedWorker, env).then(() => 'completed'),
+    new Promise(resolve => setTimeout(() => resolve('still-hung'), 150))
+  ]);
+  assert.equal(outcome, 'completed');
+  const stored = await env.AL_TIMER_STORE.getJob('outer-push-timeout-job');
+  assert.equal(stored.deliveryAttempts, 1);
+  assert.equal(stored.lastDeliveryError, 'push transport timeout');
+  assert.ok(Date.parse(stored.nextDeliveryAttemptAt) > Date.now());
 });

@@ -69,10 +69,11 @@ class SingleJobD1 {
 }
 
 class StreamAuthorityD1 {
-  constructor() {
+  constructor({ claimMetaChangesZero = false } = {}) {
     this.rows = new Map();
     this.legacyRows = new Map();
     this.writeCount = 0;
+    this.claimMetaChangesZero = claimMetaChangesZero;
   }
 
   async batch(statements) {
@@ -115,6 +116,12 @@ class StreamAuthorityD1 {
               if (!matches) return { meta: { changes: 0 } };
               this.rows.set(args[0], { ...current, due_at: args[4], updated_at: args[6] });
               this.writeCount += 1;
+              if (this.claimMetaChangesZero) {
+                return {
+                  results: sql.includes('RETURNING logical_key') ? [{ logical_key: args[0] }] : [],
+                  meta: { changes: 0 }
+                };
+              }
               return { meta: { changes: 1 } };
             }
             if (sql.includes('delivery_attempts = delivery_attempts + 1')) {
@@ -535,6 +542,26 @@ test('two cron workers can claim one automatic due row only once before sending'
     { claimed: true }
   ]);
   assert.equal(db.rows.get(transition.streamKey).due_at, claim.leaseUntil);
+});
+
+test('a D1 claim uses the returned CAS row when metadata reports zero changes', async () => {
+  const fixture = JSON.parse(await readFile(new URL('./fixtures/automatic-schedule-authority-v1.json', import.meta.url), 'utf8'));
+  const transition = fixture.vectors[0].transition;
+  const db = new StreamAuthorityD1({ claimMetaChangesZero: true });
+  const store = createD1TimerStore(db);
+  await store.transitionAutomaticStream(transition);
+
+  const result = await store.claimAutomaticDelivery({
+    streamKey: transition.streamKey,
+    authorityEpoch: transition.authorityEpoch,
+    generation: transition.generation,
+    jobId: transition.jobId,
+    expectedDueAt: transition.dueAt,
+    leaseUntil: transition.dueAt + 60_000
+  });
+
+  assert.deepEqual(result, { claimed: true });
+  assert.equal(db.rows.get(transition.streamKey).due_at, transition.dueAt + 60_000);
 });
 
 test('automatic schedule contract freezes canonical bytes and rejects coerced native types', async () => {

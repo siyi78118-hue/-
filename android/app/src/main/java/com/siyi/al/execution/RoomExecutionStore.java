@@ -1153,13 +1153,15 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         Map<String, Long> latestDirectCreatedAtByCharacter = new HashMap<>();
         for (ChatTurnEntity turn : dao.retryableTurns()) {
             if (TurnKind.DIRECT_REPLY.name().equals(turn.kind)) {
+                boolean storeOwnedV3 = isStoreOwnedV3(turn);
                 Long latestCreatedAt = latestDirectCreatedAtByCharacter.get(turn.characterId);
                 if (latestCreatedAt == null) {
                     ChatTurnEntity latest = dao.latestDirectTurn(turn.characterId);
                     latestCreatedAt = latest == null ? turn.createdAt : latest.createdAt;
                     latestDirectCreatedAtByCharacter.put(turn.characterId, latestCreatedAt);
                 }
-                if (turn.createdAt < latestCreatedAt) continue;
+                if (AlBackgroundPolicy.skipOlderDirectRetry(
+                    storeOwnedV3, turn.createdAt, latestCreatedAt)) continue;
             }
             if (turn.activeAttemptId == null) continue;
             ExecutionAttemptEntity attempt = dao.attempt(turn.activeAttemptId);

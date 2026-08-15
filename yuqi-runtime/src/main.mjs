@@ -29,6 +29,7 @@ const snapshotsDir = isAbsolute(config.snapshotsDir || '')
 mkdirSync(dirname(databasePath), { recursive: true });
 
 const store = new YuqiStore(databasePath);
+store.repairTerminalCanonicalV3LaneOwnersInternal();
 const presets = new PresetRegistry({ presetDir: join(runtimeDir, 'presets'), store });
 const promotionController = new PromotionController({
   store,

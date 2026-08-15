@@ -30,8 +30,11 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Yuqi-Registration'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-08-15.1';
+const CLOUD_TIMER_WORKER_VERSION = '2026-08-15.8';
 const FCM_ACK_MAX_ATTEMPTS = 8;
+const FIREBASE_FETCH_TIMEOUT_MS = 10_000;
+const PUSH_SUBSCRIPTION_TIMEOUT_MS = 10_000;
+const PUSH_DELIVERY_TIMEOUT_MS = 30_000;
 let lastCronSummary = null;
 
 export default {
@@ -44,7 +47,13 @@ export default {
     }
     try {
       if (request.method === 'GET' && url.pathname === '/health') {
-        return json({ ok: true, service: 'AL cloud timer', version: CLOUD_TIMER_WORKER_VERSION, cron: await getLastCron(env) });
+        return json({
+          ok: true,
+          service: 'AL cloud timer',
+          version: CLOUD_TIMER_WORKER_VERSION,
+          cron: await getLastCron(env),
+          deliveryProbe: await getDeliveryProbe(env)
+        });
       }
       if (request.method === 'GET' && url.pathname === '/logs') {
         return json({ ok: true, events: [], source: 'workers-logs' });
@@ -269,22 +278,31 @@ async function runDueJobs(env) {
             leaseUntil: Date.now() + 60_000
           });
           if (!claimed.claimed) continue;
+          await recordDeliveryProbe(env, job, 'claimed');
         }
+        await recordDeliveryProbe(env, job, 'delivery_started');
         const delivered = await deliverJob(job, env);
         await appendEvent(env, { type: 'deliver', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', ok: delivered.ok, reason: delivered.reason || delivered.fallbackReason || '', retry: !!delivered.retry, awaitingAck: !!delivered.awaitingAck, payload: delivered.payload !== false });
         if (delivered.awaitingAck) {
           summary.delivered += 1;
           if (!await deferForFcmAck(job, env)) summary.failed += 1;
+          else await recordDeliveryProbe(env, job, 'awaiting_phone_ack');
         } else if (delivered.retry) {
           summary.retry += 1;
           if (!await deferForDeliveryRetry(job, env, delivered.reason || 'push failed')) summary.failed += 1;
+          else await recordDeliveryProbe(env, job, 'retry_scheduled', { reason: delivered.reason || 'push failed' });
         } else {
           delivered.ok ? summary.delivered += 1 : summary.failed += 1;
           await clearJobRecord(job, env);
+          await recordDeliveryProbe(env, job, 'completed', { ok: !!delivered.ok });
         }
       } catch (err) {
+        await recordDeliveryProbe(env, job, 'delivery_error', { reason: String(err?.message || err).slice(0, 160) });
         await appendEvent(env, { type: 'deliver-error', jobId: job.jobId, ok: false, reason: String(err?.message || err).slice(0, 160), retry: true });
-        if (await deferForDeliveryRetry(job, env, err?.message || String(err))) summary.retry += 1;
+        if (await deferForDeliveryRetry(job, env, err?.message || String(err))) {
+          summary.retry += 1;
+          await recordDeliveryProbe(env, job, 'retry_scheduled', { reason: String(err?.message || err).slice(0, 160) });
+        }
         else summary.failed += 1;
       }
     }
@@ -310,6 +328,29 @@ async function getLastCron(env) {
   if (lastCronSummary) return lastCronSummary;
   const store = timerStore(env);
   return store.getCronSummary ? await store.getCronSummary() : null;
+}
+
+async function getDeliveryProbe(env) {
+  const store = timerStore(env);
+  return store.getDeliveryProbe ? await store.getDeliveryProbe() : null;
+}
+
+async function recordDeliveryProbe(env, job, stage, details = {}) {
+  const store = timerStore(env);
+  if (!store.saveDeliveryProbe) return;
+  try {
+    await store.saveDeliveryProbe({
+      workerVersion: CLOUD_TIMER_WORKER_VERSION,
+      stage,
+      jobId: String(job?.jobId || ''),
+      streamKey: String(job?.streamKey || ''),
+      deviceId: shortId(job?.deviceId || ''),
+      at: Date.now(),
+      ...details
+    });
+  } catch (error) {
+    console.warn('failed to persist delivery probe:', error?.message || error);
+  }
 }
 
 function timerStore(env) {
@@ -425,10 +466,15 @@ function createD1TimerStore(db) {
       const claimed = await db.prepare(`UPDATE timer_stream_authorities SET
           due_at = ?5, updated_at = ?7
         WHERE logical_key = ?1 AND authority_epoch = ?2 AND generation = ?3
-          AND active_job_id = ?4 AND due_at = ?6 AND state IN ('scheduled', 'awaiting_ack')`)
+          AND active_job_id = ?4 AND due_at = ?6 AND state IN ('scheduled', 'awaiting_ack')
+        RETURNING logical_key`)
         .bind(input.streamKey, input.authorityEpoch, input.generation, input.jobId,
           input.leaseUntil, input.expectedDueAt, Date.now()).run();
-      return { claimed: Number(claimed?.meta?.changes || 0) === 1 };
+      return {
+        claimed: Array.isArray(claimed?.results)
+          ? claimed.results.length === 1
+          : Number(claimed?.meta?.changes || 0) === 1
+      };
     },
     async deferAutomaticDelivery(input) {
       if (!input || typeof input.streamKey !== 'string' || typeof input.authorityEpoch !== 'string'
@@ -555,6 +601,15 @@ function createD1TimerStore(db) {
       await db.prepare(`INSERT INTO timer_meta (meta_key, value_json, updated_at) VALUES ('last_cron', ?1, ?2)
         ON CONFLICT(meta_key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at`)
         .bind(JSON.stringify(summary), Date.now()).run();
+    },
+    async getDeliveryProbe() {
+      const row = await db.prepare("SELECT value_json FROM timer_meta WHERE meta_key = 'last_delivery_probe'").first();
+      return row?.value_json ? JSON.parse(row.value_json) : null;
+    },
+    async saveDeliveryProbe(probe) {
+      await db.prepare(`INSERT INTO timer_meta (meta_key, value_json, updated_at) VALUES ('last_delivery_probe', ?1, ?2)
+        ON CONFLICT(meta_key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at`)
+        .bind(JSON.stringify(probe), Date.now()).run();
     }
   };
 }
@@ -744,29 +799,40 @@ function automaticDeliveryIdentity(job) {
 
 async function deliverJob(job, env) {
   const store = timerStore(env);
-  const target = await store.getSubscription(job.deviceId);
+  const target = await runStageWithTimeout(
+    'push subscription',
+    PUSH_SUBSCRIPTION_TIMEOUT_MS,
+    () => store.getSubscription(job.deviceId)
+  );
   if (!target) return { ok: false, reason: 'missing subscription', jobId: job.jobId, retry: false };
-  const result = await sendPush(target, env, {
-    type: job.type === 'role-plan' ? 'role-plan' : 'proactive',
-    deviceId: job.deviceId || '',
-    jobId: job.jobId || '',
-    charId: job.charId || '',
-    kind: job.kind || 'chat',
-    planId: job.planId || '',
-    occurrenceId: job.occurrenceId || '',
-    source: job.source || '',
-    mode: job.mode || 'planned',
-    rollChance: job.rollChance,
-    diceIntervalMs: job.diceIntervalMs,
-    diceRolls: job.diceRolls,
-    maxRolls: job.maxRolls,
-    dicePrecomputed: !!job.dicePrecomputed,
-    dueAt: job.dueAt || '',
-    test: !!job.test,
-    owner: job.automaticAuthority ? String(job.owner || 'android-v1') : undefined,
-    authorityEpoch: job.automaticAuthority ? String(job.authorityEpoch || '') : undefined,
-    generation: job.automaticAuthority ? Number(job.generation) : undefined
-  });
+  await recordDeliveryProbe(env, job, 'subscription_loaded');
+  await recordDeliveryProbe(env, job, 'push_started');
+  const result = await runStageWithTimeout(
+    'push transport',
+    PUSH_DELIVERY_TIMEOUT_MS,
+    () => sendPush(target, env, {
+      type: job.type === 'role-plan' ? 'role-plan' : 'proactive',
+      deviceId: job.deviceId || '',
+      jobId: job.jobId || '',
+      charId: job.charId || '',
+      kind: job.kind || 'chat',
+      planId: job.planId || '',
+      occurrenceId: job.occurrenceId || '',
+      source: job.source || '',
+      mode: job.mode || 'planned',
+      rollChance: job.rollChance,
+      diceIntervalMs: job.diceIntervalMs,
+      diceRolls: job.diceRolls,
+      maxRolls: job.maxRolls,
+      dicePrecomputed: !!job.dicePrecomputed,
+      dueAt: job.dueAt || '',
+      test: !!job.test,
+      owner: job.automaticAuthority ? String(job.owner || 'android-v1') : undefined,
+      authorityEpoch: job.automaticAuthority ? String(job.authorityEpoch || '') : undefined,
+      generation: job.automaticAuthority ? Number(job.generation) : undefined
+    })
+  );
+  await recordDeliveryProbe(env, job, 'push_finished', { ok: !!result?.ok, reason: String(result?.reason || '').slice(0, 160) });
   if (result.expired) {
     await store.deleteSubscription(job.deviceId);
     return { ok: false, reason: 'subscription expired', jobId: job.jobId, retry: false };
@@ -863,7 +929,7 @@ async function sendFcmPush(fcmToken, env, payload = {}) {
   for (const [key, value] of Object.entries(payload || {})) {
     if (value !== undefined && value !== null) stringData[key] = typeof value === 'string' ? value : JSON.stringify(value);
   }
-  const resp = await fetch(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(env.FIREBASE_PROJECT_ID)}/messages:send`, {
+  const resp = await fetchFirebaseWithTimeout(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(env.FIREBASE_PROJECT_ID)}/messages:send`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -879,8 +945,8 @@ async function sendFcmPush(fcmToken, env, payload = {}) {
         }
       }
     })
-  });
-  const raw = await resp.text();
+  }, 'send');
+  const raw = await runFirebaseStageWithTimeout('send body', () => resp.text());
   if (resp.status === 404 || /UNREGISTERED|registration-token-not-registered/i.test(raw)) {
     return { ok: false, expired: true, status: resp.status, reason: 'fcm token expired' };
   }
@@ -893,22 +959,59 @@ async function getFirebaseAccessToken(env) {
   if (cachedFirebaseAccessToken?.token && cachedFirebaseAccessToken.expiresAt > now + 60) {
     return cachedFirebaseAccessToken.token;
   }
-  const assertion = await createFirebaseServiceAccountJWT(env, now);
-  const resp = await fetch('https://oauth2.googleapis.com/token', {
+  const assertion = await runFirebaseStageWithTimeout(
+    'jwt',
+    () => createFirebaseServiceAccountJWT(env, now)
+  );
+  const resp = await fetchFirebaseWithTimeout('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
       assertion
     })
-  });
-  const json = await resp.json();
+  }, 'oauth');
+  const json = await runFirebaseStageWithTimeout('oauth body', () => resp.json());
   if (!resp.ok || !json.access_token) throw new Error(`firebase oauth failed ${resp.status}: ${JSON.stringify(json).slice(0, 180)}`);
   cachedFirebaseAccessToken = {
     token: json.access_token,
     expiresAt: now + Math.max(60, Number(json.expires_in) || 3600)
   };
   return json.access_token;
+}
+
+async function fetchFirebaseWithTimeout(url, options, stage) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FIREBASE_FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error(`firebase ${stage} timeout`);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function runFirebaseStageWithTimeout(stage, operation) {
+  return runStageWithTimeout(`firebase ${stage}`, FIREBASE_FETCH_TIMEOUT_MS, operation);
+}
+
+async function runStageWithTimeout(stage, timeoutMs, operation) {
+  let timeout;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`${stage} timeout`)),
+          timeoutMs
+        );
+      })
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function createFirebaseServiceAccountJWT(env, now = Math.floor(Date.now() / 1000)) {

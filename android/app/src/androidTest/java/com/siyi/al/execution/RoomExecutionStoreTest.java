@@ -2063,6 +2063,33 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
+    public void v3RetryRecoveryDoesNotSkipAnOlderFailedDirectTurnAfterANewerInput()
+        throws Exception {
+        String failedTurnId = "local-v3-recover-older";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            failedTurnId, "msg-recover-older-3", 300L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(failedTurnId), "device_gateway", 301L);
+        JSONObject checkpoint = new JSONObject(prepared.bridgeAuthorityCheckpointJson);
+        BridgeResult failure = BridgeTurnStatus.parseV3(
+            canonicalFailure(checkpoint, true, 302L).toString(), "cloud", "relay-recover-older");
+        ExecutionAttemptEntity failedAttempt = store.activeAttempt(failedTurnId);
+        store.commitVerifiedRemoteFailure(
+            failedTurnId, failedAttempt.attemptId, failure, 303L);
+
+        String newerTurnId = "local-v3-recover-newer";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            newerTurnId, "msg-recover-newer-3", 400L));
+
+        RetryRecoveryResult recovery = store.recoverDueRetries(20_000L);
+
+        assertEquals(1, recovery.restarted);
+        assertEquals(TurnState.QUEUED.name(), store.turn(failedTurnId).state);
+        assertEquals(2, store.activeAttempt(failedTurnId).sequence);
+        assertEquals(TurnState.QUEUED.name(), store.turn(newerTurnId).state);
+    }
+
+    @Test
     public void peerAwareVerifiedFailureRejectsForeignPeerBeforeAnyWrite() throws Exception {
         String localTurnId = "local-v3-peer-failure";
         store.submitTurn(yuqiThreeBubbleSubmission(localTurnId, "msg-peer-failure-3", 306L));
