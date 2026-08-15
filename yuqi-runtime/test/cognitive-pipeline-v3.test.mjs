@@ -3,6 +3,18 @@ import test from 'node:test';
 
 import { CognitivePipeline, runCognitionV3Turn } from '../src/cognitive-pipeline.mjs';
 
+const ROLE_PLAN_OUTPUT_CONTRACT_V1 = {
+  version: 1,
+  container: 'JSON array string',
+  timeConfidence: {
+    requiredFor: ['create', 'update_with_schedule'],
+    allowed: ['explicit', 'inferred'],
+    explicit: 'the user supplied a concrete execution time',
+    inferred: 'the user used a vague natural time and Yuqi selected the concrete execution time'
+  },
+  rejectMissingOrAliases: true
+};
+
 function cognitionResult(overrides = {}) {
   return {
     interactionRead: {
@@ -309,6 +321,10 @@ test('fast cognition can escalate before expression with fixed role budgets', as
     client.calls[0].options.outputSchema.properties.routeDecision.enum,
     ['fast', 'deep']
   );
+  for (const call of client.calls) {
+    assert.deepEqual(call.payload.rolePlanOutputContract, ROLE_PLAN_OUTPUT_CONTRACT_V1);
+  }
+  assert.equal(new Set(client.calls.map(call => call.payload.rolePlanOutputContract)).size, 3);
   assert.equal(result.draft.rewriteMetadata.source, 'cognition-v3');
 });
 

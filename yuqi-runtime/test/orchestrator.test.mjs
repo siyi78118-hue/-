@@ -10,6 +10,7 @@ import {
   hardValidateReply,
   normalizeBrainDraft,
   normalizeCanonicalBrainDraft,
+  normalizeCanonicalV3RolePlanOperations,
   YuqiOrchestrator
 } from '../src/orchestrator.mjs';
 import { materializeBrainDraft } from '../src/cognition-contract.mjs';
@@ -215,7 +216,7 @@ test('all v3 role-plan lanes preserve canonical role-plan action descriptors', (
     }
   };
   const operation = {
-    op: 'cancel', planId: 'plan_7', source: 'private_decision'
+    op: 'cancel', planId: 'plan_7'
   };
   for (const rolloutKey of [
     'ROLE_PLAN_CHAT', 'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE'
@@ -229,7 +230,7 @@ test('all v3 role-plan lanes preserve canonical role-plan action descriptors', (
 test('canonical v3 role-plan normalization rejects malformed or over-limit operation lists', () => {
   assert.equal(typeof orchestratorModule.normalizeCanonicalV3RolePlanOperations, 'function');
   const operation = {
-    op: 'cancel', planId: 'plan_7', source: 'private_decision'
+    op: 'cancel', planId: 'plan_7'
   };
   assert.throws(() => orchestratorModule.normalizeCanonicalV3RolePlanOperations(
     Array.from({ length: 13 }, () => operation)
@@ -418,6 +419,98 @@ function withFixture(outputs, run, {
     rmSync(dir, { recursive: true, force: true });
   });
 }
+
+test('legacy release repairs the overnight missing time-confidence shape before commit', () => withFixture({
+  brain: [
+    JSON.stringify({
+      action: 'send',
+      reply: '嗯，晚安。明天醒了就来找你。',
+      rolePlanOperationsJson: JSON.stringify([{
+        op: 'create',
+        type: 'private_message',
+        source: 'spoken',
+        title: '早安',
+        intent: '明早问候',
+        sourceQuote: '但是明天的早安不要忘了，虽然你很大概率还是会忘',
+        evidenceMessageIds: ['msg_overnight'],
+        schedule: { kind: 'once', at: '2026-08-15T08:00:00+08:00' }
+      }])
+    }),
+    JSON.stringify({
+      action: 'send',
+      reply: '嗯，晚安。明天醒了就来找你。',
+      rolePlanOperationsJson: JSON.stringify([{
+        op: 'create',
+        type: 'private_message',
+        source: 'spoken',
+        title: '早安',
+        intent: '明早问候',
+        sourceQuote: '但是明天的早安不要忘了，虽然你很大概率还是会忘',
+        evidenceMessageIds: ['msg_overnight'],
+        schedule: { kind: 'once', at: '2026-08-15T08:00:00+08:00' },
+        timeConfidence: 'inferred'
+      }])
+    })
+  ]
+}, async ({ orchestrator, codex }) => {
+  const result = await orchestrator.runStructuredRoleDraftOnly({
+    turnId: 'turn_overnight_contract',
+    role: 'brain',
+    request: { task: 'reply_as_yuqi' },
+    clientUserMessageId: 'turn_overnight_contract_brain',
+    profile: { model: 'gpt-5.6-sol', effort: 'medium' },
+    rolePlanContractVersion: 1
+  });
+  assert.equal(codex.calls.length, 2);
+  assert.equal(JSON.parse(result.rolePlanOperationsJson)[0].timeConfidence, 'inferred');
+  assert.deepEqual(codex.calls[0].input.rolePlanOutputContract.timeConfidence.allowed,
+    ['explicit', 'inferred']);
+  assert.match(codex.calls[1].input.protocolRepair.rule, /timeConfidence.*explicit.*inferred/);
+}));
+
+test('legacy release rejects the whole result after two malformed role-plan drafts', () => {
+  const malformed = JSON.stringify({
+    action: 'send',
+    reply: '嗯，明早见。',
+    rolePlanOperationsJson: JSON.stringify([{
+      op: 'create', type: 'private_message', source: 'spoken',
+      title: '早安', intent: '明早问候',
+      schedule: { kind: 'once', at: '2026-08-15T08:00:00+08:00' }
+    }])
+  });
+  return withFixture({ brain: [malformed, malformed] }, async ({ orchestrator, codex, store }) => {
+    await assert.rejects(() => orchestrator.runStructuredRoleDraftOnly({
+      turnId: 'turn_overnight_contract_invalid',
+      role: 'brain',
+      request: { task: 'reply_as_yuqi' },
+      clientUserMessageId: 'turn_overnight_contract_invalid_brain',
+      profile: { model: 'gpt-5.6-sol', effort: 'medium' },
+      rolePlanContractVersion: 1
+    }), /brain returned invalid role plan output/);
+    assert.equal(codex.calls.length, 2);
+    for (const table of ['visible_result_groups', 'visible_result_actions', 'cloud_deliveries']) {
+      assert.equal(store.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count, 0);
+    }
+  });
+});
+
+test('canonical role-plan normalization rejects old update and missing create shapes', () => {
+  assert.throws(() => normalizeCanonicalV3RolePlanOperations([{
+    op: 'create', type: 'private_message', source: 'spoken', title: '早安', intent: '明早问候',
+    schedule: { kind: 'once', at: '2026-08-15T08:00:00+08:00' }
+  }]), /time confidence/);
+  assert.throws(() => normalizeCanonicalV3RolePlanOperations([{
+    op: 'update', planId: 'plan_1', source: 'spoken', timeConfidence: 'explicit',
+    patch: { schedule: { kind: 'daily', time: '09:00' } }
+  }]), /update fields/);
+  assert.deepEqual(normalizeCanonicalV3RolePlanOperations([{
+    op: 'update', planId: 'plan_1',
+    patch: {
+      schedule: { kind: 'daily', time: '09:00' },
+      timeConfidence: 'explicit'
+    }
+  }])[0].patch.timeConfidence, 'explicit');
+});
 
 function commitProactiveResult(store, seq, action = 'skip') {
   const saved = store.submitTurn(triggerEnvelope(seq));
@@ -1125,8 +1218,8 @@ test('v3 role-plan updates use the pinned target identity and render multiple op
     targetRevision: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
   };
   const operations = [
-    { op: 'update', planId: 'plan_7', patch: { title: '晨间提醒' }, source: 'user_created' },
-    { op: 'cancel', planId: 'plan_7', source: 'user_created' }
+    { op: 'update', planId: 'plan_7', patch: { title: '晨间提醒' } },
+    { op: 'cancel', planId: 'plan_7' }
   ];
   assert.equal(orchestratorModule.requiresUserConfirmation({
     protocolVersion: 3,
@@ -1151,13 +1244,13 @@ test('v3 role-plan updates use the pinned target identity and render multiple op
   assert.throws(() => orchestratorModule.requiresUserConfirmation({
     protocolVersion: 3,
     kind: 'DIRECT_REPLY',
-    operations: [{ ...operations[1], planId: 'plan_forged', source: 'private_decision' }],
+    operations: [{ ...operations[1], planId: 'plan_forged' }],
     targetSnapshots: [target]
   }), /role plan confirmation authority conflict/);
 });
 
 test('private role-plan operations keep their action without confirmation renderer, while mixed sources fail closed', () => {
-  const privateOperation = { op: 'cancel', planId: 'plan_private', source: 'private_decision' };
+  const privateOperation = { op: 'cancel', planId: 'plan_private' };
   const target = {
     planId: 'plan_private', source: 'private_decision', title: '内部安排',
     targetRevision: 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
@@ -1169,8 +1262,8 @@ test('private role-plan operations keep their action without confirmation render
     protocolVersion: 3,
     kind: 'DIRECT_REPLY',
     operations: [
-      { op: 'cancel', planId: 'plan_private', source: 'private_decision' },
-      { op: 'cancel', planId: 'plan_user', source: 'spoken' }
+      { op: 'cancel', planId: 'plan_private' },
+      { op: 'cancel', planId: 'plan_user' }
     ],
     targetSnapshots: [target, { ...target, planId: 'plan_user', source: 'spoken', title: '公开安排' }]
   }), /role plan confirmation authority conflict/);
@@ -1228,12 +1321,12 @@ test('role-plan renderer consumes only the resolved descriptor and computes post
     schedule: { kind: 'daily', time: '08:00', endsAt: '2026-07-31T08:00:00+08:00' }
   };
   const canonicalPayload = {
-    op: 'update', source: 'spoken',
+    op: 'update', planId: 'plan_pinned',
     patch: {
       title: '服务器备份',
-      schedule: { kind: 'daily', time: '09:00', endsAt: '2026-08-01T09:00:00+08:00' }
-    },
-    timeConfidence: 'explicit'
+      schedule: { kind: 'daily', time: '09:00', endsAt: '2026-08-01T09:00:00+08:00' },
+      timeConfidence: 'explicit'
+    }
   };
   const descriptor = {
     kind: 'role_plan_update', targetKey: 'role_plan:plan_pinned', targetRevision: 'rev-7',
@@ -1268,7 +1361,7 @@ test('role-plan confirmation target snapshots come from resolver canonical targe
   const bundle = orchestrator.canonicalRolePlanActionBundle({
     protocolVersion: 3, rolloutKey: 'DIRECT_REPLY'
   }, {
-    rolePlanOperations: [{ op: 'cancel', planId: 'plan_pinned', source: 'spoken' }]
+    rolePlanOperations: [{ op: 'cancel', planId: 'plan_pinned' }]
   });
   assert.equal(bundle.targetSnapshots[0].title, '权威安排');
   assert.equal(bundle.targetSnapshots[0].planId, 'plan_pinned');
@@ -1301,12 +1394,12 @@ test('canonical role-plan bundle resolves each action once and freezes descripto
   };
   const draft = {
     rolePlanOperations: [{
-      op: 'update', planId: 'plan_once', source: 'spoken',
+      op: 'update', planId: 'plan_once',
       patch: {
         title: '规范标题',
-        schedule: { kind: 'daily', time: '09:00', endsAt: '2026-08-02T09:00:00+08:00' }
-      },
-      timeConfidence: 'explicit'
+        schedule: { kind: 'daily', time: '09:00', endsAt: '2026-08-02T09:00:00+08:00' },
+        timeConfidence: 'explicit'
+      }
     }]
   };
   const bundle = orchestrator.canonicalResolvedActionBundle(

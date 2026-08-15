@@ -3,6 +3,18 @@ import test from 'node:test';
 
 import { CognitivePipeline } from '../src/cognitive-pipeline.mjs';
 
+const ROLE_PLAN_OUTPUT_CONTRACT_V1 = {
+  version: 1,
+  container: 'JSON array string',
+  timeConfidence: {
+    requiredFor: ['create', 'update_with_schedule'],
+    allowed: ['explicit', 'inferred'],
+    explicit: 'the user supplied a concrete execution time',
+    inferred: 'the user used a vague natural time and Yuqi selected the concrete execution time'
+  },
+  rejectMissingOrAliases: true
+};
+
 function cognition(requiresDeepCognition = false) {
   return {
     schemaVersion: 2,
@@ -229,6 +241,10 @@ test('v2 release draft calls the model but never writes a legacy turn checkpoint
     'cognition:2.1.0',
     'expression:2.1.0'
   ]);
+  for (const call of calls) {
+    assert.deepEqual(call.input.rolePlanOutputContract, ROLE_PLAN_OUTPUT_CONTRACT_V1);
+  }
+  assert.notEqual(calls[0].input.rolePlanOutputContract, calls[1].input.rolePlanOutputContract);
 });
 
 test('v2 release draft rejects an empty pinned preset before calling a model', async () => {
@@ -350,8 +366,7 @@ test('role-plan cognition can use the existing plan domain without expression re
   decided.actionIntent.channel = 'chat';
   decided.actionIntent.rolePlanOperationsJson = JSON.stringify([{
     op: 'complete',
-    planId: 'plan_1',
-    evidenceMessageIds: ['msg_1']
+    planId: 'plan_1'
   }]);
   const { pipeline } = fixture([decided, expression('这件事处理好了。')]);
   const result = await pipeline.runForeground({

@@ -23,6 +23,10 @@ import { materializeImageAttachments } from './image-attachments.mjs';
 import { reduceCognitiveState } from './cognitive-state.mjs';
 import { compileAgencyView } from './agency-state.mjs';
 import { comparisonContractForMode } from './comparison-contract.mjs';
+import {
+  normalizeRolePlanOperationList,
+  rolePlanModelContractV1
+} from './role-plan-operation-contract.mjs';
 
 export function canonicalActionSetForDraft({ isProactiveV3, draft, resolve }) {
   if (typeof resolve !== 'function') throw new Error('canonical action resolver is required');
@@ -173,21 +177,11 @@ function normalizeRolePlanOperations(value) {
 }
 
 export function normalizeCanonicalV3RolePlanOperations(value) {
-  let source = value;
-  if (typeof source === 'string') {
-    const text = source.trim();
-    if (!text || text === '[]') return [];
-    try { source = JSON.parse(text); } catch {
-      throw new Error('canonical v3 role plan operations authority conflict');
-    }
+  try {
+    return normalizeRolePlanOperationList(value);
+  } catch (error) {
+    throw new Error(`canonical v3 role plan operations authority conflict: ${error.message}`);
   }
-  if (!Array.isArray(source)) {
-    throw new Error('canonical v3 role plan operations must be an array');
-  }
-  if (source.length > 12) {
-    throw new Error('canonical v3 role plan operations exceed limit');
-  }
-  return normalizeRolePlanOperations(source);
 }
 
 const ROLE_PLAN_CONFIRMATION_SOURCES = new Set([
@@ -343,14 +337,15 @@ function rolePlanOperationNeedsExplicitTime(operation) {
   if (operation.op === 'create') return true;
   if (operation.op !== 'update') return false;
   const patch = operation.patch;
-  return Object.hasOwn(operation, 'schedule')
-    || (isPlainRolePlanObject(patch) && Object.hasOwn(patch, 'schedule'));
+  return isPlainRolePlanObject(patch) && Object.hasOwn(patch, 'schedule');
 }
 
 function rolePlanOperationUsesInferredTime(operation) {
   return isPlainRolePlanObject(operation)
     && rolePlanOperationNeedsExplicitTime(operation)
-    && operation.timeConfidence === 'inferred';
+    && (operation.op === 'create'
+      ? operation.timeConfidence
+      : operation.patch?.timeConfidence) === 'inferred';
 }
 
 function rolePlanOperationNeedsVisibleConfirmation(operation) {
@@ -419,12 +414,15 @@ function validateRolePlanConfirmationOperation(operation, targetSnapshot = null)
     rolePlanConfirmationConflict('operation source is not user-authorized');
   }
   if (rolePlanOperationNeedsExplicitTime(operation)) {
-    if (!['explicit', 'inferred'].includes(operation.timeConfidence)) {
+    const timeConfidence = operation.op === 'create'
+      ? operation.timeConfidence
+      : operation.patch?.timeConfidence;
+    if (!['explicit', 'inferred'].includes(timeConfidence)) {
       rolePlanConfirmationConflict('time confidence is invalid');
     }
     const schedule = operation.op === 'create'
       ? operation.schedule
-      : operation.schedule ?? operation.patch?.schedule;
+      : operation.patch?.schedule;
     rolePlanScheduleValue(schedule);
   }
   if (operation.op === 'create') {
@@ -1584,7 +1582,8 @@ export class YuqiOrchestrator {
           request: brainRequest,
           clientUserMessageId: `${turn.turnId}_release_brain_${attempt}`,
           profile: roleExecutionProfile(route === 'fast' ? 'fast' : 'deep', 'brain', this.roleProfiles),
-          localImagePaths: execution.localImagePaths
+          localImagePaths: execution.localImagePaths,
+          rolePlanContractVersion: 1
         })
       ));
       if (draft.action === 'skip' && !isAutomaticKind(envelope.kind)) {
@@ -1650,7 +1649,8 @@ export class YuqiOrchestrator {
         request: supervisorRequest,
         clientUserMessageId: `${turn.turnId}_release_supervisor_${attempt}`,
         profile: roleExecutionProfile('deep', 'supervisor', this.roleProfiles),
-        localImagePaths: execution.localImagePaths
+        localImagePaths: execution.localImagePaths,
+        rolePlanContractVersion: 1
       }), {
         attempt,
         previous,
@@ -1732,7 +1732,8 @@ export class YuqiOrchestrator {
     request,
     clientUserMessageId,
     profile,
-    localImagePaths = []
+    localImagePaths = [],
+    rolePlanContractVersion = 0
   }) {
     if (!profile?.model || !profile?.effort) throw new Error(`missing execution profile for ${role}`);
     if (!String(turnId || '')) throw new Error(`turnId is required for ${role}`);
@@ -1742,12 +1743,17 @@ export class YuqiOrchestrator {
     const roleImagePaths = Array.isArray(localImagePaths) && localImagePaths.length
       ? localImagePaths
       : this.turnImagePaths.get(turnId) || [];
+    const requestWithContract = rolePlanContractVersion === 1
+      ? { ...request, rolePlanOutputContract: rolePlanModelContractV1() }
+      : request;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
-      const payload = attempt === 1 ? request : {
-        ...request,
+      const payload = attempt === 1 ? requestWithContract : {
+        ...requestWithContract,
         protocolRepair: {
           attempt,
-          rule: 'Return exactly one JSON object that matches the supplied output schema.',
+          rule: role === 'brain' && rolePlanContractVersion === 1
+            ? 'Return the exact output schema. Every time-bearing role-plan create/update must include timeConfidence as explicit or inferred.'
+            : 'Return exactly one JSON object that matches the supplied output schema.',
           invalidOutput: invalidOutput.slice(0, 2_000)
         }
       };
@@ -1778,7 +1784,16 @@ export class YuqiOrchestrator {
       }
       invalidOutput = String(response.text || '');
       try {
-        return parseRoleJson(invalidOutput, role);
+        const parsed = parseRoleJson(invalidOutput, role);
+        if (role === 'brain' && rolePlanContractVersion === 1
+          && Object.hasOwn(parsed, 'rolePlanOperationsJson')) {
+          try {
+            normalizeRolePlanOperationList(parsed.rolePlanOperationsJson);
+          } catch (error) {
+            throw new Error(`brain returned invalid role plan output: ${error.message}`);
+          }
+        }
+        return parsed;
       } catch (error) {
         if (attempt === 2 || !String(error.message).startsWith(`${role} returned invalid`)) throw error;
       }

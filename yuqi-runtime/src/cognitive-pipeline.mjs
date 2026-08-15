@@ -22,6 +22,7 @@ import {
 import { resolveRelationshipStage } from './relationship-stage.mjs';
 import { repairPlanForFinding, superviseLivedTurn } from './lived-quality-supervisor.mjs';
 import { parseReleaseModelProfile } from './release-model-profile.mjs';
+import { rolePlanModelContractV1 } from './role-plan-operation-contract.mjs';
 
 const COGNITION_FAST_ROUTE_SCHEMA_V3 = Object.freeze({
   type: 'object',
@@ -274,6 +275,7 @@ function rolePayload({ turn, system, task, content }) {
     authoritativeReleaseId: turn.authoritativeReleaseId || null,
     system,
     task,
+    rolePlanOutputContract: rolePlanModelContractV1(),
     ...content
   };
 }
@@ -648,6 +650,7 @@ export class CognitivePipeline {
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       const response = await this.codexClient.runTurn(sessionRole, JSON.stringify({
         system,
+        rolePlanOutputContract: rolePlanModelContractV1(),
         ...payload,
         ...(attempt === 1 ? {} : {
           protocolRepair: {
