@@ -16,25 +16,25 @@ test('release builds remain unsigned when the formal keystore is unavailable', (
 });
 
 test('formal signing uses the explicit Android release version instead of the workflow run number', () => {
-  assert.match(androidBuild, /AL_VERSION_CODE"\) \?: "123"/);
-  assert.match(androidBuild, /AL_VERSION_NAME"\) \?: "1\.0\.123"/);
-  assert.match(androidWorkflow, /AL_RELEASE_VERSION_CODE:\s*123/);
-  assert.match(androidWorkflow, /AL_RELEASE_VERSION_NAME:\s*1\.0\.123/);
+  assert.match(androidBuild, /AL_VERSION_CODE"\) \?: "124"/);
+  assert.match(androidBuild, /AL_VERSION_NAME"\) \?: "1\.0\.124"/);
+  assert.match(androidWorkflow, /AL_RELEASE_VERSION_CODE:\s*124/);
+  assert.match(androidWorkflow, /AL_RELEASE_VERSION_NAME:\s*1\.0\.124/);
   assert.doesNotMatch(androidWorkflow, /github\.run_number/);
 });
 
-test('the app shell and service worker are pinned to the complete 1.0.123 recovery build', () => {
-  assert.match(appHtml, /const APP_BUILD_VERSION = '2026-08-16\.123';/);
-  assert.match(serviceWorker, /const CACHE_NAME = 'rpchat-v123';/);
+test('the app shell and service worker are pinned to the complete 1.0.124 recovery build', () => {
+  assert.match(appHtml, /const APP_BUILD_VERSION = '2026-08-16\.124';/);
+  assert.match(serviceWorker, /const CACHE_NAME = 'rpchat-v124';/);
   assert.match(serviceWorker, /'\.\/lib\/complete-app-restoration\.js'/);
 });
 
 test('the signed branch build publishes an OTA manifest that names the real release asset', () => {
-  assert.equal(updateManifest.latestBuild, 123);
-  assert.equal(updateManifest.version, '1.0.123');
+  assert.equal(updateManifest.latestBuild, 124);
+  assert.equal(updateManifest.version, '1.0.124');
   assert.equal(
     updateManifest.releaseUrl,
-    'https://github.com/siyi78118-hue/-/releases/download/android-v123/app-release.apk'
+    'https://github.com/siyi78118-hue/-/releases/download/android-v124/app-release.apk'
   );
   assert.match(
     androidWorkflow,

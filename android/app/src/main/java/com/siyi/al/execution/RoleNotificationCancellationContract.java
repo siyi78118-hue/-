@@ -1,5 +1,6 @@
 package com.siyi.al.execution;
 
+import com.siyi.al.execution.db.RoleNotificationCancellationEntity;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.TreeSet;
@@ -13,6 +14,21 @@ final class RoleNotificationCancellationContract {
 
     static boolean isValidNotificationId(int notificationId) {
         return notificationId >= MIN_NOTIFICATION_ID && notificationId <= MAX_NOTIFICATION_ID;
+    }
+
+    static boolean isExactReplay(
+        RoleNotificationCancellationEntity actual,
+        RoleNotificationCancellationEntity expected
+    ) {
+        return actual != null && expected != null
+            && expected.cancellationKey.equals(actual.cancellationKey)
+            && expected.controlId.equals(actual.controlId)
+            && expected.characterId.equals(actual.characterId)
+            && expected.notificationId == actual.notificationId
+            && expected.intentChecksum.equals(actual.intentChecksum)
+            && expected.state.equals(actual.state)
+            && expected.createdAt == actual.createdAt
+            && expected.updatedAt == actual.updatedAt;
     }
 
     static List<Integer> notificationIdsForTurns(List<String> turnIds) {

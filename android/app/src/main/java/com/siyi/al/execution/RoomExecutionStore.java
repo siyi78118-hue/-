@@ -3531,7 +3531,11 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             intent.createdAt = createdAt;
             intent.updatedAt = createdAt;
             if (dao.insertRoleNotificationCancellation(intent) != 1L) {
-                throw new IllegalStateException("role notification cancellation already exists");
+                RoleNotificationCancellationEntity existing =
+                    dao.roleNotificationCancellation(controlId, notificationId);
+                if (!RoleNotificationCancellationContract.isExactReplay(existing, intent)) {
+                    throw new IllegalStateException("role notification cancellation authority conflict");
+                }
             }
         }
     }

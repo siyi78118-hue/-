@@ -182,6 +182,12 @@ public interface AlExecutionDao {
         String streamKey, String authorityEpoch, long generation, String activeJobId, long updatedAt
     );
 
+    @Query("SELECT * FROM role_notification_cancellations WHERE control_id = :controlId "
+        + "AND notification_id = :notificationId LIMIT 1")
+    RoleNotificationCancellationEntity roleNotificationCancellation(
+        String controlId, int notificationId
+    );
+
     @Query("SELECT * FROM role_notification_cancellations WHERE state = 'waiting' "
         + "ORDER BY created_at ASC, cancellation_key ASC")
     List<RoleNotificationCancellationEntity> pendingRoleNotificationCancellations();

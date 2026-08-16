@@ -30,6 +30,7 @@ import com.siyi.al.execution.db.RawMessageEntity;
 import com.siyi.al.execution.db.RolePlanEntity;
 import com.siyi.al.execution.db.RolePlanHistoryEntity;
 import com.siyi.al.execution.db.RolePlanOccurrenceEntity;
+import com.siyi.al.execution.db.RoleNotificationCancellationEntity;
 import com.siyi.al.execution.db.YuqiAnnotationEntity;
 import com.siyi.al.execution.bridge.BridgeResult;
 import com.siyi.al.execution.bridge.BridgeTurnStatus;
@@ -1332,6 +1333,47 @@ public class RoomExecutionStoreTest {
         assertNotNull(control);
         assertEquals(1L, database.executionDao().roleNotificationCancellationCount());
         assertEquals(0, database.executionDao().turnIdsForCharacter("yuqi").size());
+    }
+
+    @Test
+    public void exactPreexistingNotificationCancellationIsAnIdempotentRoleDeleteReplay() throws Exception {
+        String turnId = "task20e-role-delete-existing-cancellation";
+        store.submitTurn(new TurnSubmission(
+            turnId, "yuqi", "task20e-role-delete-existing-cancellation-message",
+            TurnKind.DIRECT_REPLY, "{\"text\":\"旧通知\"}", "{\"messages\":[]}", null, 1L));
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi"));
+        JSONObject receipt = backupReceipt("yuqi", 417L);
+        long requestedAt = 418L;
+        LifecycleControlCodec.Encoded encoded = LifecycleControlCodec.encodeRoleDelete(
+            "yuqi", "device_gateway", requestedAt, receipt);
+        String controlId = encoded.controlId;
+        int notificationId = AlNotificationFactory.messageNotificationId(turnId);
+        JSONObject cancellationBasis = new JSONObject()
+            .put("contract", "android-role-notification-cancellation-v1")
+            .put("controlId", controlId)
+            .put("characterId", "yuqi")
+            .put("notificationId", notificationId)
+            .put("createdAt", requestedAt);
+        String checksum = BridgeAuthority.sha256CanonicalJson(cancellationBasis);
+        RoleNotificationCancellationEntity existing = new RoleNotificationCancellationEntity();
+        existing.cancellationKey = "rncan_" + checksum;
+        existing.controlId = controlId;
+        existing.characterId = "yuqi";
+        existing.notificationId = notificationId;
+        existing.intentChecksum = checksum;
+        existing.state = "waiting";
+        existing.createdAt = requestedAt;
+        existing.updatedAt = requestedAt;
+        assertEquals(1L, database.executionDao().insertRoleNotificationCancellation(existing));
+
+        LifecycleControl control = store.createRoleDelete(
+            "yuqi", "device_gateway", cursorChecksum, receipt, requestedAt, null);
+
+        assertEquals(controlId, control.controlId);
+        assertEquals(1L, database.executionDao().roleNotificationCancellationCount());
+        assertEquals(0, database.executionDao().turnIdsForCharacter("yuqi").size());
+        assertEquals(1, store.drainPendingRoleNotificationCancellations(ignored -> {}));
     }
 
     @Test
