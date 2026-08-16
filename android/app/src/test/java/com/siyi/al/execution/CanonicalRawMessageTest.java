@@ -2,6 +2,7 @@ package com.siyi.al.execution;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertThrows;
 
 import com.siyi.al.execution.db.RawMessageEntity;
 import java.nio.charset.StandardCharsets;
@@ -41,6 +42,37 @@ public class CanonicalRawMessageTest {
             assertNotEquals(vector.getString("canonicalItemChecksum"),
                 RoomExecutionStore.canonicalRawMessageChecksum(row));
         }
+    }
+
+    @Test
+    public void recoveryAcceptsOnlyKnownHistoricalChecksumSchemes() throws Exception {
+        RawMessageEntity row = new RawMessageEntity();
+        row.messageId = "legacy-message";
+        row.turnId = "legacy-turn";
+        row.characterId = "yuqi";
+        row.speakerId = "user";
+        row.speakerType = "user";
+        row.recipientId = "yuqi";
+        row.content = "旧消息正文";
+        row.sentAt = 123456789L;
+        row.origin = "phone";
+        row.deviceId = "phone:visible";
+        row.deviceSeq = 1L;
+        row.syncSeq = 1L;
+        String canonical = RoomExecutionStore.canonicalRawMessageChecksum(row);
+
+        row.checksum = canonical;
+        assertEquals(canonical, RoomExecutionStore.recoverableRawMessageChecksum(row));
+
+        row.checksum = row.messageId;
+        assertEquals(canonical, RoomExecutionStore.recoverableRawMessageChecksum(row));
+
+        row.checksum = "a8a8c00f8d77454372d895280c8f6e34c832cc3eaa22e8eeb519a455e1fc4297";
+        assertEquals(canonical, RoomExecutionStore.recoverableRawMessageChecksum(row));
+
+        row.checksum = "unknown-corruption";
+        assertThrows(IllegalStateException.class,
+            () -> RoomExecutionStore.recoverableRawMessageChecksum(row));
     }
 
     private static Path fixturePath() {

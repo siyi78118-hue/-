@@ -22,6 +22,8 @@ import com.siyi.al.execution.db.RoleNotificationCancellationEntity;
 import com.siyi.al.execution.bridge.BridgeInput;
 import com.siyi.al.execution.bridge.BridgeResult;
 import com.siyi.al.execution.bridge.BridgeTurnStatus;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.HashMap;
@@ -2524,10 +2526,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             try {
                 for (int index = 0; index < visibleCount; index += 1) {
                     RawMessageEntity row = rows.get(index);
-                    String checksum = canonicalRawMessageChecksum(row);
-                    if (!checksum.equals(row.checksum)) {
-                        throw new IllegalStateException("Android app recovery message checksum conflict");
-                    }
+                    String checksum = recoverableRawMessageChecksum(row);
                     messages.put(new JSONObject()
                         .put("messageId", row.messageId)
                         .put("turnId", row.turnId)
@@ -6572,6 +6571,36 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
 
     static String canonicalRawMessageChecksum(RawMessageEntity row) {
         return BridgeAuthority.sha256CanonicalJson(canonicalRawMessageObject(row));
+    }
+
+    static String recoverableRawMessageChecksum(RawMessageEntity row) {
+        if (row == null) throw new IllegalArgumentException("raw message is required");
+        String canonical = canonicalRawMessageChecksum(row);
+        String stored = row.checksum == null ? "" : row.checksum;
+        boolean legacyVisibleIdentity = !row.messageId.isEmpty()
+            && row.messageId.equals(stored)
+            && row.deviceId != null
+            && row.deviceId.endsWith(":visible")
+            && row.syncSeq > 0L;
+        if (canonical.equals(stored) || legacyVisibleIdentity
+            || legacyFiveFieldRawMessageChecksum(row).equals(stored)) {
+            return canonical;
+        }
+        throw new IllegalStateException("Android app recovery message checksum conflict");
+    }
+
+    private static String legacyFiveFieldRawMessageChecksum(RawMessageEntity row) {
+        String basis = row.messageId + "\n" + row.turnId + "\n" + row.speakerId
+            + "\n" + row.content + "\n" + row.sentAt;
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                .digest(basis.getBytes(StandardCharsets.UTF_8));
+            StringBuilder output = new StringBuilder();
+            for (byte item : digest) output.append(String.format("%02x", item & 0xff));
+            return output.toString();
+        } catch (Exception error) {
+            throw new IllegalStateException("SHA-256 is unavailable", error);
+        }
     }
 
     private static JSONObject canonicalRawMessageObject(RawMessageEntity row) {

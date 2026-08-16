@@ -1,6 +1,6 @@
 importScripts('./lib/live-chat-director.js');
 
-const CACHE_NAME = 'rpchat-v120';
+const CACHE_NAME = 'rpchat-v121';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './warm-modern.css', './lib/api-endpoint.js', './lib/role-plan-domain.js', './lib/role-plan-repository.js', './lib/live-chat-director.js', './lib/app-state-recovery.js', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;

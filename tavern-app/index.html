@@ -14117,7 +14117,7 @@ function renderAppStateRecoveryScreen(recoveryDecision) {
       <div>原因：${esc(model.reasonCode)}</div>
       ${roles ? `<ul style="padding-left:20px;margin:12px 0 0">${roles}</ul>` : ''}
     </div>
-    <div id="app-state-recovery-error" style="color:#a33;line-height:1.6;margin-top:12px"></div>
+    <div id="app-state-recovery-error" style="color:#555;line-height:1.6;margin-top:12px"></div>
     <button id="app-state-recovery-commit" ${canRecover ? '' : 'disabled'} style="width:100%;margin-top:18px;padding:13px;border:0;border-radius:12px;background:#315f52;color:#fff;font-size:16px">恢复角色入口</button>
     <button id="app-state-recovery-copy" style="width:100%;margin-top:10px;padding:12px;border:1px solid #bbb;border-radius:12px;background:#fff;font-size:15px">复制诊断</button>
     <p style="line-height:1.8;margin:18px 0 0;color:#666">恢复完成前请勿执行其他数据操作。</p>`;
@@ -14126,10 +14126,13 @@ function renderAppStateRecoveryScreen(recoveryDecision) {
       .catch(error => { blocker.querySelector('#app-state-recovery-error').textContent = error?.message || '复制失败'; });
   });
   blocker.querySelector('#app-state-recovery-commit')?.addEventListener('click', event => {
-    event.currentTarget.disabled = true;
-    commitAppStateRecovery(model.source).catch(error => {
-      event.currentTarget.disabled = false;
-      blocker.querySelector('#app-state-recovery-error').textContent = error?.message || '恢复未完成';
+    const button = event.currentTarget;
+    const statusNode = blocker.querySelector('#app-state-recovery-error');
+    AppStateRecovery.runRecoveryUiAction({
+      button,
+      statusNode,
+      pendingText: '正在读取并校验手机原生角色与消息，请勿退出应用…',
+      operation: () => commitAppStateRecovery(model.source)
     });
   });
 }

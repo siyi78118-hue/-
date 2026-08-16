@@ -335,10 +335,12 @@
     const keys = ['characterId', 'name', 'playerName', 'systemPrompt', 'createdAt',
       'sourceSnapshotId', 'sourceChecksum'];
     assertExactKeys(candidate, keys, 'ROLE_CANDIDATE');
-    for (const key of ['characterId', 'name', 'playerName', 'sourceSnapshotId', 'sourceChecksum']) {
+    for (const key of ['characterId', 'sourceSnapshotId', 'sourceChecksum']) {
       requireRecoveryString(candidate, key);
     }
-    requireRecoveryString(candidate, 'systemPrompt', true);
+    for (const key of ['name', 'playerName', 'systemPrompt']) {
+      requireRecoveryString(candidate, key, true);
+    }
     requireRecoveryInteger(candidate, 'createdAt');
     if (!/^[0-9a-f]{64}$/.test(candidate.sourceChecksum)) {
       throw new Error('APP_STATE_RECOVERY_ROLE_CHECKSUM_CONFLICT');
@@ -511,6 +513,25 @@
     return true;
   }
 
+  async function runRecoveryUiAction({ button, statusNode, operation, pendingText } = {}) {
+    if (!button || !statusNode || typeof operation !== 'function') {
+      throw new Error('APP_STATE_RECOVERY_UI_ADAPTER_INVALID');
+    }
+    const idleText = String(button.textContent || '恢复角色入口');
+    button.disabled = true;
+    button.textContent = '正在恢复…';
+    statusNode.textContent = String(pendingText || '正在读取并校验手机原生数据，请勿退出应用…');
+    try {
+      await operation();
+      return true;
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = idleText;
+      statusNode.textContent = error?.message || '恢复未完成';
+      return false;
+    }
+  }
+
   function createWriteGuard() {
     let decisionState = decision('pending', true, '', 'APP_STATE_RECOVERY_FROZEN');
     let recoveryChecksum = '';
@@ -558,6 +579,7 @@
     verifyNativeRecoveryMessage,
     runRecoveryTransaction,
     rollbackPreparedRecovery,
+    runRecoveryUiAction,
     createWriteGuard
   });
 });

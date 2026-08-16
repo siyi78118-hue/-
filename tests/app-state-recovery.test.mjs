@@ -311,6 +311,23 @@ test('native role and message candidates use frozen cross-language checksums', a
   await assert.rejects(() => verifyNativeRecoveryMessage({ ...message, content: '篡改' }), /CHECKSUM_CONFLICT/);
 });
 
+test('native role candidates allow empty historical presentation fields', async () => {
+  const { verifyNativeRoleCandidate, sha256CanonicalJson } = recoveryModule();
+  const basis = {
+    characterId: 'legacy-role',
+    name: '',
+    playerName: '',
+    systemPrompt: '',
+    createdAt: 1,
+    sourceSnapshotId: 'legacy-snapshot'
+  };
+  const candidate = { ...basis, sourceChecksum: await sha256CanonicalJson(basis) };
+  const verified = await verifyNativeRoleCandidate(candidate);
+  assert.equal(verified.characterId, 'legacy-role');
+  assert.equal(verified.name, '');
+  assert.equal(verified.playerName, '');
+});
+
 test('two-phase recovery commits verified state before unlocking writes', async () => {
   const { runRecoveryTransaction } = recoveryModule();
   const harness = transactionHarness(emptyRawState);
@@ -380,5 +397,26 @@ test('faults at every pre-unlock boundary restore the exact prior raw state', as
     assert.equal(harness.journalRows.get('recovery_candidate_v1').state, 'rolled_back');
     assert.equal(harness.unlocked, '');
   }
+});
+
+test('recovery action keeps a stable button reference and reports asynchronous failure', async () => {
+  const { runRecoveryUiAction } = recoveryModule();
+  const button = { disabled: false, textContent: '恢复角色入口' };
+  const statusNode = { textContent: '' };
+
+  const ok = await runRecoveryUiAction({
+    button,
+    statusNode,
+    pendingText: '正在读取手机原生数据…',
+    operation: async () => {
+      await Promise.resolve();
+      throw new Error('APP_STATE_RECOVERY_MESSAGE_CHECKSUM_CONFLICT');
+    }
+  });
+
+  assert.equal(ok, false);
+  assert.equal(button.disabled, false);
+  assert.equal(button.textContent, '恢复角色入口');
+  assert.equal(statusNode.textContent, 'APP_STATE_RECOVERY_MESSAGE_CHECKSUM_CONFLICT');
 });
 
