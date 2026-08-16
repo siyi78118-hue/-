@@ -11,6 +11,19 @@
     'scenario', 'firstMessage', 'mesExample', 'systemPrompt', 'postHistoryInstructions',
     'tags', 'creatorNotes', 'createdAt', 'stagePersona', 'stagePersonaConfig'
   ]);
+  const WEB_SOURCE_FIELDS = Object.freeze([
+    ['settings', 'settings', {}],
+    ['characters', 'characters', []],
+    ['chats', 'allChats', {}],
+    ['moments', 'allMoments', []]
+  ]);
+  const AVATAR_SOURCE_PRIORITY = Object.freeze([
+    ['current', 'current'],
+    ['recovery_before', 'recoveryBefore'],
+    ['legacy', 'legacy'],
+    ['pre_recovery_mirror', 'preRecoveryMirror'],
+    ['current_mirror', 'mirror']
+  ]);
 
   function clone(value) {
     if (value === undefined) return undefined;
@@ -44,6 +57,123 @@
     if (payload.length % 4 !== 0) return false;
     const padding = payload.endsWith('==') ? 2 : payload.endsWith('=') ? 1 : 0;
     return ((payload.length * 3) / 4) - padding <= 20 * 1024 * 1024;
+  }
+
+  function emptySemanticState() {
+    return { settings: {}, characters: [], allChats: {}, allMoments: [], updatedAt: 0 };
+  }
+
+  function parseRawSemanticSource(raw, keyPrefix, invalidSources, label) {
+    const result = emptySemanticState();
+    if (raw === null || raw === undefined) return result;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      invalidSources.push(`${label}:shape`);
+      return result;
+    }
+    for (const [slot, semanticKey] of WEB_SOURCE_FIELDS) {
+      const key = `${keyPrefix}_${slot}`;
+      const value = raw[key];
+      if (value === null || value === undefined) continue;
+      if (typeof value !== 'string') {
+        invalidSources.push(`${label}:${key}`);
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(value);
+        const valid = semanticKey === 'characters' || semanticKey === 'allMoments'
+          ? Array.isArray(parsed)
+          : parsed && typeof parsed === 'object' && !Array.isArray(parsed);
+        if (!valid) throw new Error('shape');
+        result[semanticKey] = clone(parsed);
+      } catch {
+        invalidSources.push(`${label}:${key}`);
+      }
+    }
+    const updatedKey = `${keyPrefix}_app_state_updated_at`;
+    if (raw[updatedKey] !== null && raw[updatedKey] !== undefined) {
+      const updatedAt = Number(raw[updatedKey]);
+      if (Number.isSafeInteger(updatedAt) && updatedAt >= 0) result.updatedAt = updatedAt;
+      else invalidSources.push(`${label}:${updatedKey}`);
+    }
+    return result;
+  }
+
+  function readLegacyRawStorage(storage) {
+    const raw = {};
+    for (const [slot] of WEB_SOURCE_FIELDS) {
+      raw[`tavern_${slot}`] = storage?.getItem?.(`tavern_${slot}`) ?? null;
+    }
+    raw.tavern_app_state_updated_at = storage?.getItem?.('tavern_app_state_updated_at') ?? null;
+    return raw;
+  }
+
+  function semanticState(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return emptySemanticState();
+    return {
+      settings: value.settings && typeof value.settings === 'object' && !Array.isArray(value.settings)
+        ? clone(value.settings) : {},
+      characters: Array.isArray(value.characters) ? clone(value.characters) : [],
+      allChats: value.allChats && typeof value.allChats === 'object' && !Array.isArray(value.allChats)
+        ? clone(value.allChats) : {},
+      allMoments: Array.isArray(value.allMoments) ? clone(value.allMoments) : [],
+      updatedAt: Number.isSafeInteger(Number(value.updatedAt)) && Number(value.updatedAt) >= 0
+        ? Number(value.updatedAt) : 0
+    };
+  }
+
+  async function collectWebRestorationSources({
+    current = {}, storage, journal, mirror = {}, builtinYuqi = {}, sha256CanonicalJson
+  } = {}) {
+    if (!storage?.getItem || !journal?.get) {
+      throw new Error('APP_RESTORATION_SOURCE_ADAPTER_INVALID');
+    }
+    const invalidSources = [];
+    const beforeRaw = await journal.get('recovery_before_v1');
+    const beforeMirror = await journal.get('recovery_before_mirror_v1');
+    const recoveryBefore = parseRawSemanticSource(
+      beforeRaw, 'rpchat', invalidSources, 'recovery_before');
+    const legacy = parseRawSemanticSource(
+      readLegacyRawStorage(storage), 'tavern', invalidSources, 'legacy');
+    let preRecoveryMirror = emptySemanticState();
+    if (beforeMirror !== null && beforeMirror !== undefined) {
+      const keys = beforeMirror && typeof beforeMirror === 'object' && !Array.isArray(beforeMirror)
+        ? Object.keys(beforeMirror).sort().join(',') : '';
+      if (keys !== 'checksum,present,value,version'
+        || beforeMirror.version !== 1 || typeof beforeMirror.present !== 'boolean'
+        || !/^[0-9a-f]{64}$/.test(beforeMirror.checksum || '')
+        || typeof sha256CanonicalJson !== 'function') {
+        throw new Error('APP_RESTORATION_PRE_MIRROR_SHAPE_CONFLICT');
+      }
+      const actual = await sha256CanonicalJson({
+        present: beforeMirror.present,
+        value: beforeMirror.value
+      });
+      if (actual !== beforeMirror.checksum) {
+        throw new Error('APP_RESTORATION_PRE_MIRROR_CHECKSUM_CONFLICT');
+      }
+      if (beforeMirror.present) preRecoveryMirror = semanticState(beforeMirror.value);
+    }
+    return deepFreeze({
+      current: semanticState(current),
+      recoveryBefore,
+      legacy,
+      preRecoveryMirror,
+      mirror: semanticState(mirror),
+      builtinYuqi: clone(builtinYuqi),
+      invalidSources: [...new Set(invalidSources)].sort()
+    });
+  }
+
+  function readVerifiedAvatarCandidate(roleId, sources = {}) {
+    const safeRoleId = String(roleId || '');
+    if (!safeRoleId) return null;
+    for (const [source, key] of AVATAR_SOURCE_PRIORITY) {
+      const role = roleFrom(sources[key], safeRoleId);
+      if (role && validAvatarData(role.avatarData)) {
+        return deepFreeze({ source, avatarData: role.avatarData });
+      }
+    }
+    return null;
   }
 
   function mergeRoleByField(roleId, sources, fallback) {
@@ -116,11 +246,11 @@
   }
 
   async function buildPlan({
-    current = {}, recoveryBefore = {}, legacy = {}, mirror = {}, native = {},
+    current = {}, recoveryBefore = {}, legacy = {}, preRecoveryMirror = {}, mirror = {}, native = {},
     builtinYuqi = {}, deletionTargets = []
   } = {}) {
     const excludedRoleIds = assertDeletionTargets(deletionTargets);
-    const roleSources = [current, recoveryBefore, legacy, mirror];
+    const roleSources = [current, recoveryBefore, legacy, preRecoveryMirror, mirror];
     const yuqi = mergeRoleByField('yuqi', roleSources, builtinYuqi);
     const nativeMessages = (Array.isArray(native.messages) ? native.messages : []).map(row => ({
       ...clone(row),
@@ -130,14 +260,15 @@
     }));
     const messages = mergeMessages([
       messageRows(mirror, 'yuqi'),
+      messageRows(preRecoveryMirror, 'yuqi'),
       messageRows(legacy, 'yuqi'),
       messageRows(recoveryBefore, 'yuqi'),
       nativeMessages,
       messageRows(current, 'yuqi')
     ]);
     const moments = mergeIdentityRows([
-      mirror.allMoments, legacy.allMoments, recoveryBefore.allMoments,
-      verifiedNativeMoments(native), current.allMoments
+      mirror.allMoments, preRecoveryMirror.allMoments, legacy.allMoments,
+      recoveryBefore.allMoments, verifiedNativeMoments(native), current.allMoments
     ]);
     const unconfirmedEmptyRoleIds = (Array.isArray(native.roles) ? native.roles : [])
       .filter(row => row && Number(row.rawMessageCount) === 0
@@ -190,6 +321,8 @@
   return Object.freeze({
     buildPlan,
     applyWebCandidate,
+    collectWebRestorationSources,
+    readVerifiedAvatarCandidate,
     validAvatarData,
     CONFIRMED_DELETION_ID
   });

@@ -138,3 +138,115 @@ test('native moments require explicit verified evidence and are never inferred f
   });
   assert.deepEqual(plan.moments, []);
 });
+
+test('web restoration collector reads every intact source without deleting recovery snapshots', async () => {
+  const { collectWebRestorationSources, readVerifiedAvatarCandidate } = restorationModule();
+  const { sha256CanonicalJson } = require('../tavern-app/lib/app-state-recovery.js');
+  const beforeRaw = {
+    rpchat_settings: JSON.stringify({ playerName: '恢复前用户' }),
+    rpchat_characters: JSON.stringify([{
+      id: 'yuqi', name: '虞栖', description: '恢复前资料',
+      avatarData: 'data:image/png;base64,YmVmb3Jl'
+    }]),
+    rpchat_chats: JSON.stringify({ yuqi: { messages: [{ id: 'before-message', content: '旧消息' }] } }),
+    rpchat_moments: '[]',
+    rpchat_app_state_updated_at: '10'
+  };
+  const preMirrorValue = state({
+    id: 'yuqi', name: '虞栖', personality: '恢复前镜像性格',
+    avatarData: 'data:image/png;base64,cHJlLW1pcnJvcg=='
+  });
+  const preMirrorRecord = {
+    version: 1,
+    present: true,
+    value: preMirrorValue
+  };
+  preMirrorRecord.checksum = await sha256CanonicalJson({
+    present: preMirrorRecord.present,
+    value: preMirrorRecord.value
+  });
+  const values = new Map([
+    ['tavern_settings', JSON.stringify({ playerName: '旧版用户' })],
+    ['tavern_characters', JSON.stringify([{
+      id: 'yuqi', name: '虞栖', scenario: '旧版关系',
+      avatarData: 'data:image/png;base64,bGVnYWN5'
+    }])],
+    ['tavern_chats', '{}'],
+    ['tavern_moments', '[]'],
+    ['tavern_app_state_updated_at', '5']
+  ]);
+  const storage = { getItem: key => values.has(key) ? values.get(key) : null };
+  const journalReads = [];
+  const journal = {
+    async get(key) {
+      journalReads.push(key);
+      if (key === 'recovery_before_v1') return beforeRaw;
+      if (key === 'recovery_before_mirror_v1') return preMirrorRecord;
+      return null;
+    },
+    async put() { throw new Error('collector must be read-only'); }
+  };
+
+  const sources = await collectWebRestorationSources({
+    current: state({ id: 'yuqi', name: '虞栖' }),
+    storage,
+    journal,
+    mirror: state({ id: 'yuqi', name: '虞栖', creatorNotes: '当前镜像' }),
+    builtinYuqi: builtinYuqi(),
+    sha256CanonicalJson
+  });
+
+  assert.deepEqual(journalReads, ['recovery_before_v1', 'recovery_before_mirror_v1']);
+  assert.equal(sources.recoveryBefore.characters[0].description, '恢复前资料');
+  assert.equal(sources.legacy.characters[0].scenario, '旧版关系');
+  assert.equal(sources.preRecoveryMirror.characters[0].personality, '恢复前镜像性格');
+  assert.equal(sources.mirror.characters[0].creatorNotes, '当前镜像');
+  assert.equal(readVerifiedAvatarCandidate('yuqi', sources).source, 'recovery_before');
+});
+
+test('avatar recovery is role-bound, priority-ordered, and never scrapes malformed JSON', async () => {
+  const { collectWebRestorationSources, readVerifiedAvatarCandidate } = restorationModule();
+  const values = new Map([
+    ['tavern_characters', JSON.stringify([
+      { id: 'not-yuqi', avatarData: 'data:image/png;base64,d3Jvbmc=' },
+      { id: 'yuqi', avatarData: 'not-an-image' }
+    ])],
+    ['tavern_settings', '{}'], ['tavern_chats', '{}'], ['tavern_moments', '[]']
+  ]);
+  const sources = await collectWebRestorationSources({
+    current: state({ id: 'yuqi', name: '虞栖' }),
+    storage: { getItem: key => values.get(key) ?? null },
+    journal: {
+      async get(key) {
+        if (key === 'recovery_before_v1') {
+          return {
+            rpchat_settings: '{}',
+            rpchat_characters: '[{"id":"yuqi","avatarData":"data:image/png;base64,c2VjcmV0"}',
+            rpchat_chats: '{}', rpchat_moments: '[]', rpchat_app_state_updated_at: '1'
+          };
+        }
+        return null;
+      }
+    },
+    mirror: state(), builtinYuqi: builtinYuqi()
+  });
+
+  assert.equal(readVerifiedAvatarCandidate('yuqi', sources), null);
+  assert.deepEqual(sources.invalidSources, ['recovery_before:rpchat_characters']);
+});
+
+test('pre-recovery mirror checksum mismatch rejects the complete source collection', async () => {
+  const { collectWebRestorationSources } = restorationModule();
+  await assert.rejects(() => collectWebRestorationSources({
+    current: state(), storage: { getItem: () => null },
+    journal: {
+      async get(key) {
+        return key === 'recovery_before_mirror_v1'
+          ? { version: 1, present: true, value: state(), checksum: '0'.repeat(64) }
+          : null;
+      }
+    },
+    mirror: state(), builtinYuqi: builtinYuqi(),
+    sha256CanonicalJson: async () => '1'.repeat(64)
+  }), /APP_RESTORATION_PRE_MIRROR_CHECKSUM_CONFLICT/);
+});

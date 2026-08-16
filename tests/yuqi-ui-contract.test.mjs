@@ -1894,6 +1894,19 @@ test('native recovery commit pages verified Room data through a separate recover
   assert.match(recovery, /location\.reload\(\)/);
 });
 
+test('complete phone recovery loads its closed source collector before the app script and keeps source reads separate', () => {
+  assert.match(html, /<script src="\.\/lib\/complete-app-restoration\.js"><\/script>/);
+  const recovery = html.slice(
+    html.indexOf('const APP_RECOVERY_JOURNAL_DB'),
+    html.indexOf('async function syncFromServiceWorkerState')
+  );
+  assert.match(recovery, /collectCompleteRestorationSources/);
+  assert.match(recovery, /collectWebRestorationSources/);
+  assert.match(recovery, /journal: AppRecoveryJournal/);
+  assert.match(recovery, /readExistingAppStateMirrorForRecovery/);
+  assert.match(recovery, /YUQI_FIRST_PROFILE/);
+});
+
 test('MemoryDB upgrade never deletes an existing meta store during recovery', () => {
   const open = html.slice(html.indexOf('async open()'), html.indexOf('readFallback()'));
   assert.doesNotMatch(open, /deleteObjectStore\('meta'\)/);

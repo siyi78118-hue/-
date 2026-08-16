@@ -963,10 +963,13 @@ button.cell:active{background:#ececec}
 <script src="./lib/role-plan-repository.js"></script>
 <script src="./lib/live-chat-director.js"></script>
 <script src="./lib/app-state-recovery.js"></script>
+<script src="./lib/complete-app-restoration.js"></script>
 <script src="./lib/yuqi-core-preset.js"></script>
 <script>
 const AppStateRecovery = window.ALAppStateRecovery;
+const CompleteAppRestoration = window.ALCompleteAppRestoration;
 if (!AppStateRecovery) throw new Error('APP_STATE_RECOVERY_MODULE_MISSING');
+if (!CompleteAppRestoration) throw new Error('APP_RESTORATION_MODULE_MISSING');
 const appStateRecoveryGuard = AppStateRecovery.createWriteGuard();
 let currentAppStateRecoveryDecision = null;
 const APP_STATE_CRITICAL_KEYS = new Set(['settings', 'characters', 'chats', 'moments']);
@@ -13825,6 +13828,18 @@ async function restoreExistingAppStateMirrorForRecovery(value) {
     transaction.oncomplete = () => { db.close(); resolve(true); };
     transaction.onerror = () => { db.close(); reject(transaction.error || new Error('APP_STATE_MIRROR_RESTORE_FAILED')); };
     transaction.onabort = () => { db.close(); reject(transaction.error || new Error('APP_STATE_MIRROR_RESTORE_ABORTED')); };
+  });
+}
+
+async function collectCompleteRestorationSources() {
+  const mirror = await readExistingAppStateMirrorForRecovery();
+  return CompleteAppRestoration.collectWebRestorationSources({
+    current: appStateRecoveryLocalEvidence(),
+    storage: localStorage,
+    journal: AppRecoveryJournal,
+    mirror: mirror && mirror.unavailable !== true ? mirror : {},
+    builtinYuqi: YUQI_FIRST_PROFILE,
+    sha256CanonicalJson: AppStateRecovery.sha256CanonicalJson
   });
 }
 
