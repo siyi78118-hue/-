@@ -330,6 +330,53 @@ export function validateYuqiBackupReceipt(raw) {
   return { ...normalized, receiptChecksum: checksums.receiptChecksum };
 }
 
+const YUQI_BACKUP_RECEIPT_RESPONSE_KEYS = Object.freeze([
+  'protocolVersion', 'type', 'requestChecksum', 'roleId', 'peerId',
+  'requestedAt', 'receipt', 'checksum'
+]);
+
+export function validateYuqiBackupReceiptResponse(raw, expected = {}) {
+  assertClosedKeys(raw, YUQI_BACKUP_RECEIPT_RESPONSE_KEYS, 'Yuqi backup receipt response');
+  if (raw.protocolVersion !== 3 || raw.type !== 'YUQI_BACKUP_RECEIPT') {
+    throw new Error('invalid Yuqi backup receipt response identity');
+  }
+  if (typeof raw.requestChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(raw.requestChecksum)) {
+    throw new Error('invalid Yuqi backup receipt response request checksum');
+  }
+  const roleId = requireNativeBackupId(raw.roleId, 'Yuqi backup receipt response roleId');
+  const peerId = requireNativeBackupId(raw.peerId, 'Yuqi backup receipt response peerId');
+  const requestedAt = requireNativeBackupInteger(
+    raw.requestedAt, 'Yuqi backup receipt response requestedAt', { positive: true });
+  const receipt = validateYuqiBackupReceipt(raw.receipt);
+  if (receipt.roleId !== roleId || receipt.createdAt !== requestedAt) {
+    throw new Error('Yuqi backup receipt response receipt binding conflict');
+  }
+  const normalized = {
+    protocolVersion: 3,
+    type: 'YUQI_BACKUP_RECEIPT',
+    requestChecksum: raw.requestChecksum,
+    roleId,
+    peerId,
+    requestedAt,
+    receipt
+  };
+  if (typeof raw.checksum !== 'string' || !/^[a-f0-9]{64}$/.test(raw.checksum)
+    || raw.checksum !== contentHash(normalized)) {
+    throw new Error('Yuqi backup receipt response checksum conflict');
+  }
+  for (const [key, value] of Object.entries({
+    requestChecksum: raw.requestChecksum,
+    roleId,
+    peerId,
+    requestedAt
+  })) {
+    if (expected[key] !== undefined && expected[key] !== value) {
+      throw new Error(`Yuqi backup receipt response ${key} conflict`);
+    }
+  }
+  return { ...normalized, checksum: raw.checksum };
+}
+
 export function deliveryItemsForResult(result = {}) {
   const turnId = String(result?.turnId || '');
   if (!turnId) return [];

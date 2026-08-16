@@ -14,6 +14,7 @@ import com.siyi.al.execution.LifecycleControl;
 import com.siyi.al.execution.LifecycleControlCodec;
 import com.siyi.al.execution.LifecycleControlSender;
 import java.lang.reflect.Method;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.ArrayDeque;
@@ -113,6 +114,102 @@ public class BridgeClientTest {
         assertEquals("YUQI_BACKUP_REQUEST", sent.getString("type"));
         assertEquals(head.toString(), sent.getJSONObject("androidRoomHead").toString());
         assertEquals(checksumWithout(sent, "checksum"), sent.getString("checksum"));
+    }
+
+    @Test public void verifiedBackupFallsBackFromLanTransportFailureToOneBoundCloudReceipt() throws Exception {
+        long requestedAt = 1784400000100L;
+        JSONObject head = androidRoomBackupHead();
+        JSONObject request = new JSONObject()
+            .put("protocolVersion", 3)
+            .put("type", "YUQI_BACKUP_REQUEST")
+            .put("requestVersion", "yuqi-backup-request-v1")
+            .put("roleId", "yuqi")
+            .put("peerId", "device_123456")
+            .put("requestedAt", requestedAt)
+            .put("androidRoomHead", head);
+        request.put("checksum", BridgeAuthority.sha256CanonicalJson(request));
+        JSONObject receipt = backupReceipt("yuqi", requestedAt);
+        JSONObject response = new JSONObject()
+            .put("protocolVersion", 3)
+            .put("type", "YUQI_BACKUP_RECEIPT")
+            .put("requestChecksum", request.getString("checksum"))
+            .put("roleId", "yuqi")
+            .put("peerId", "device_123456")
+            .put("requestedAt", requestedAt)
+            .put("receipt", receipt);
+        response.put("checksum", BridgeAuthority.sha256CanonicalJson(response));
+        JSONObject encrypted = encrypt(response.toString(), new byte[12]);
+        JSONObject outer = new JSONObject()
+            .put("messageId", "bkack_123456789012345678901234")
+            .put("deviceId", "device_123456")
+            .put("direction", "pc_to_phone")
+            .put("ciphertext", encrypted.getString("ciphertext"))
+            .put("nonce", encrypted.getString("nonce"))
+            .put("idempotencyKey", "bkackidem_123456789012345678")
+            .put("byteCount", Base64.getDecoder().decode(encrypted.getString("ciphertext")).length)
+            .put("createdAt", requestedAt + 50L)
+            .put("expiresAt", requestedAt + 86_400_000L);
+        List<String> targets = new ArrayList<>();
+        BridgeClient.Transport transport = (method, target, body, headers) -> {
+            targets.add(target);
+            if (target.endsWith("/v3/backups/yuqi")) throw new SocketTimeoutException("lan unavailable");
+            if (target.endsWith("/bridge/enqueue")) {
+                JSONObject sent = new JSONObject(body);
+                return new BridgeClient.HttpResult(201, new JSONObject()
+                    .put("ok", true)
+                    .put("messageId", sent.getString("messageId"))
+                    .put("idempotent", false).toString());
+            }
+            if (target.contains("/bridge/poll?")) {
+                return new BridgeClient.HttpResult(200, new JSONObject()
+                    .put("ok", true).put("messages", new JSONArray().put(outer)).toString());
+            }
+            if (target.endsWith("/bridge/ack")) {
+                return new BridgeClient.HttpResult(200,
+                    "{\"ok\":true,\"deleted\":1}");
+            }
+            throw new AssertionError("unexpected target " + target);
+        };
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null, transport, () -> requestedAt + 100L,
+            millis -> {}, null, null,
+            new BridgeClient.Base64Codec() {
+                @Override public byte[] decode(String value) { return Base64.getDecoder().decode(value); }
+                @Override public String encode(byte[] value) { return Base64.getEncoder().encodeToString(value); }
+            }
+        );
+
+        assertEquals(receipt.toString(),
+            client.requestVerifiedBackup("yuqi", head, requestedAt).toString());
+        assertEquals(4, targets.size());
+        assertTrue(targets.get(0).endsWith("/v3/backups/yuqi"));
+        assertTrue(targets.get(1).endsWith("/bridge/enqueue"));
+        assertTrue(targets.get(2).contains("/bridge/poll?"));
+        assertTrue(targets.get(3).endsWith("/bridge/ack"));
+    }
+
+    @Test public void genericCloudDrainLeavesBackupReceiptForTheWaitingBackupRequest() throws Exception {
+        JSONObject receipt = backupReceipt("yuqi", 1784400000100L);
+        JSONObject response = new JSONObject()
+            .put("protocolVersion", 3)
+            .put("type", "YUQI_BACKUP_RECEIPT")
+            .put("requestChecksum", repeat('d', 64))
+            .put("roleId", "yuqi")
+            .put("peerId", "device_123456")
+            .put("requestedAt", 1784400000100L)
+            .put("receipt", receipt);
+        response.put("checksum", BridgeAuthority.sha256CanonicalJson(response));
+        int[] persistCalls = {0};
+        FakeTransport transport = new FakeTransport();
+        BridgeClient client = new BridgeClient(
+            cloudConfig(), null, transport, () -> 1784400000200L, millis -> {}, null,
+            raw -> { persistCalls[0] += 1; return true; }
+        );
+
+        assertFalse(client.processDecodedCloudInboxItem(
+            new JSONObject().put("messageId", "bkack_pending_123456"), response));
+        assertEquals(0, persistCalls[0]);
+        assertTrue(transport.targets.isEmpty());
     }
 
     @Test public void verifiedBackupRejectsMalformedRoomHeadAndForgedReceiptId() throws Exception {
@@ -1169,6 +1266,17 @@ public class BridgeClientTest {
                 .put("failure", JSONObject.NULL)
                 .put("result", result)
                 .put("redactedAt", JSONObject.NULL));
+    }
+
+    private static JSONObject encrypt(String plaintext, byte[] nonce) throws Exception {
+        byte[] key = Base64.getDecoder().decode("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"),
+            new GCMParameterSpec(128, nonce));
+        return new JSONObject()
+            .put("ciphertext", Base64.getEncoder().encodeToString(
+                cipher.doFinal(plaintext.getBytes(StandardCharsets.UTF_8))))
+            .put("nonce", Base64.getEncoder().encodeToString(nonce));
     }
 
     private static String decrypt(String ciphertext, String nonce) throws Exception {

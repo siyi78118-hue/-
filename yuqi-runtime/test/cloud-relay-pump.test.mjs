@@ -7,7 +7,11 @@ import {
   encryptRelayPayload
 } from '../src/cloud-relay-pump.mjs';
 import { deriveAuthorityLineageKey } from '../src/authority-identity.mjs';
-import { contentHash, deriveYuqiBackupReceiptId } from '../src/protocol.mjs';
+import {
+  contentHash,
+  deriveYuqiBackupReceiptId,
+  validateYuqiBackupReceiptResponse
+} from '../src/protocol.mjs';
 
 const keyBase64 = Buffer.alloc(32, 7).toString('base64');
 const envelope = {
@@ -215,6 +219,122 @@ function roleDeleteApplied(control, appliedAt = 1784400000300) {
   };
   return { ...value, checksum: contentHash(value) };
 }
+
+function cloudYuqiBackupRequest() {
+  const cursor = {
+    characterId: 'char_1783694247588_zojx',
+    nativeCompletedTurnId: null,
+    nativeCompletedGroupId: null,
+    nativeCompletedSequence: 0,
+    uiAppliedTurnId: null,
+    uiAppliedGroupId: null,
+    uiAppliedSequence: 0,
+    localSequence: 0,
+    clearedThroughSequence: 0,
+    clearEpoch: 0,
+    clearedAt: 0,
+    chatOpen: false,
+    updatedAt: 1786900000000
+  };
+  cursor.cursorChecksum = contentHash({ contract: 'conversation-cursor-clear-v1', ...cursor });
+  const androidRoomHeadBasis = {
+    headVersion: 'android-room-backup-head-v1',
+    roleId: cursor.characterId,
+    roomSchemaVersion: 14,
+    cursor,
+    lifecycleHead: null,
+    capturedAt: 1786900000100
+  };
+  const basis = {
+    protocolVersion: 3,
+    type: 'YUQI_BACKUP_REQUEST',
+    requestVersion: 'yuqi-backup-request-v1',
+    roleId: cursor.characterId,
+    peerId: 'phone_cloud',
+    requestedAt: androidRoomHeadBasis.capturedAt,
+    androidRoomHead: {
+      ...androidRoomHeadBasis,
+      checksum: contentHash(androidRoomHeadBasis)
+    }
+  };
+  return { ...basis, checksum: contentHash(basis) };
+}
+
+function cloudYuqiBackupReceipt(request) {
+  const basis = {
+    receiptVersion: 'yuqi-backup-receipt-v1',
+    receiptId: deriveYuqiBackupReceiptId({
+      roleId: request.roleId,
+      manifestChecksum: 'a'.repeat(64),
+      snapshotSha256: 'b'.repeat(64),
+      logicalChecksum: 'c'.repeat(64),
+      createdAt: request.requestedAt
+    }),
+    roleId: request.roleId,
+    manifestChecksum: 'a'.repeat(64),
+    snapshotSha256: 'b'.repeat(64),
+    logicalChecksum: 'c'.repeat(64),
+    createdAt: request.requestedAt
+  };
+  return { ...basis, receiptChecksum: contentHash(basis) };
+}
+
+test('cloud backup request creates one persisted receipt and atomically returns its encrypted response', async () => {
+  const request = cloudYuqiBackupRequest();
+  const receipt = cloudYuqiBackupReceipt(request);
+  const encrypted = encryptRelayPayload(request, keyBase64, Buffer.alloc(12, 9));
+  const calls = [];
+  let responseEnvelope = null;
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example',
+    deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64,
+    orchestrator: { async process() { throw new Error('backup must not enter turn processing'); } },
+    createVerifiedBackup: async input => {
+      calls.push(input);
+      return { receipt };
+    },
+    fetchImpl: async (url, options = {}) => {
+      const path = new URL(url).pathname;
+      if (path === '/bridge/poll') {
+        return Response.json({ ok: true, messages: [{
+          messageId: 'relay_backup_request_1', ...encrypted
+        }] });
+      }
+      if (path === '/bridge/ack-with-response') {
+        const exchange = JSON.parse(options.body);
+        assert.equal(exchange.incomingMessageId, 'relay_backup_request_1');
+        responseEnvelope = exchange.response;
+        return Response.json({
+          ok: true,
+          incomingMessageId: exchange.incomingMessageId,
+          responseMessageId: exchange.response.messageId,
+          idempotent: false
+        });
+      }
+      throw new Error(`unexpected relay path ${path}`);
+    },
+    clock: () => 1786900000200
+  });
+
+  const result = await pump.pumpOnce();
+  assert.deepEqual(result, { processed: 1, failed: 0, suppressed: 0, skipped: false });
+  assert.deepEqual(calls, [{
+    roleId: request.roleId,
+    peerId: request.peerId,
+    requestedAt: request.requestedAt,
+    androidRoomHead: request.androidRoomHead
+  }]);
+  assert.ok(responseEnvelope);
+  const decoded = decryptRelayPayload(responseEnvelope, keyBase64);
+  assert.deepEqual(validateYuqiBackupReceiptResponse(decoded, {
+    requestChecksum: request.checksum,
+    roleId: request.roleId,
+    peerId: request.peerId,
+    requestedAt: request.requestedAt
+  }).receipt, receipt);
+});
 
 test('decrypts a phone envelope, reconciles first, and enqueues one opaque reply', async () => {
   const relay = relayFixture();

@@ -24,6 +24,10 @@ public final class LifecycleControlCodec {
         "receiptVersion", "receiptId", "roleId", "manifestChecksum",
         "snapshotSha256", "logicalChecksum", "createdAt", "receiptChecksum"
     ));
+    private static final Set<String> BACKUP_RECEIPT_RESPONSE_KEYS = new HashSet<>(Arrays.asList(
+        "protocolVersion", "type", "requestChecksum", "roleId", "peerId",
+        "requestedAt", "receipt", "checksum"
+    ));
 
     private LifecycleControlCodec() { }
 
@@ -173,6 +177,54 @@ public final class LifecycleControlCodec {
             return new JSONObject(value.toString());
         } catch (Exception error) {
             throw new IllegalArgumentException("backup receipt clone conflict", error);
+        }
+    }
+
+    public static JSONObject validateBackupReceiptResponse(
+        JSONObject value, String expectedRequestChecksum, String expectedRoleId,
+        String expectedPeerId, long expectedRequestedAt
+    ) {
+        if (value == null || !BACKUP_RECEIPT_RESPONSE_KEYS.equals(keysOf(value))) {
+            throw new IllegalArgumentException("Yuqi backup receipt response shape conflict");
+        }
+        requireChecksum(expectedRequestChecksum, "expected requestChecksum");
+        requireId(expectedRoleId, "expected roleId");
+        requireId(expectedPeerId, "expected peerId");
+        requirePositiveSafe(expectedRequestedAt, "expected requestedAt");
+        if (!(value.opt("protocolVersion") instanceof Number)
+            || value.opt("protocolVersion") instanceof Float
+            || value.opt("protocolVersion") instanceof Double
+            || ((Number) value.opt("protocolVersion")).longValue() != 3L
+            || !"YUQI_BACKUP_RECEIPT".equals(value.opt("type"))) {
+            throw new IllegalArgumentException("Yuqi backup receipt response identity conflict");
+        }
+        requireChecksum(value.opt("requestChecksum"), "requestChecksum");
+        requireId(value.opt("roleId"), "roleId");
+        requireId(value.opt("peerId"), "peerId");
+        requireSafeInteger(value.opt("requestedAt"), "requestedAt");
+        requirePositiveSafe(((Number) value.opt("requestedAt")).longValue(), "requestedAt");
+        requireChecksum(value.opt("checksum"), "checksum");
+        if (!expectedRequestChecksum.equals(value.opt("requestChecksum"))
+            || !expectedRoleId.equals(value.opt("roleId"))
+            || !expectedPeerId.equals(value.opt("peerId"))
+            || expectedRequestedAt != ((Number) value.opt("requestedAt")).longValue()) {
+            throw new IllegalArgumentException("Yuqi backup receipt response request binding conflict");
+        }
+        JSONObject receipt = value.optJSONObject("receipt");
+        validateBackupReceiptShape(receipt);
+        try {
+            if (!expectedRoleId.equals(receipt.getString("roleId"))
+                || expectedRequestedAt != receipt.getLong("createdAt")) {
+                throw new IllegalArgumentException("Yuqi backup receipt response receipt binding conflict");
+            }
+            JSONObject basis = new JSONObject(value.toString());
+            basis.remove("checksum");
+            if (!value.getString("checksum").equals(BridgeAuthority.sha256CanonicalJson(basis))) {
+                throw new IllegalArgumentException("Yuqi backup receipt response checksum conflict");
+            }
+            return new JSONObject(receipt.toString());
+        } catch (JSONException error) {
+            throw new IllegalArgumentException("Yuqi backup receipt response conflict", error);
         }
     }
 

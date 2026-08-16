@@ -34,6 +34,34 @@ public class LifecycleControlCodecTest {
     }
 
     @Test
+    public void cloudBackupReceiptResponseIsClosedAndBoundToTheOriginalRequest() throws Exception {
+        JSONObject receipt = backupReceipt("yuqi", 1784400000100L);
+        JSONObject response = new JSONObject()
+            .put("protocolVersion", 3)
+            .put("type", "YUQI_BACKUP_RECEIPT")
+            .put("requestChecksum", repeatHex('d'))
+            .put("roleId", "yuqi")
+            .put("peerId", "device-1")
+            .put("requestedAt", 1784400000100L)
+            .put("receipt", receipt);
+        response.put("checksum", BridgeAuthority.sha256CanonicalJson(response));
+
+        assertEquals(receipt.toString(), LifecycleControlCodec.validateBackupReceiptResponse(
+            response, repeatHex('d'), "yuqi", "device-1", 1784400000100L).toString());
+
+        JSONObject foreign = new JSONObject(response.toString()).put("peerId", "device-2");
+        foreign.put("checksum", checksumWithout(foreign, "checksum"));
+        assertThrows(IllegalArgumentException.class, () ->
+            LifecycleControlCodec.validateBackupReceiptResponse(
+                foreign, repeatHex('d'), "yuqi", "device-1", 1784400000100L));
+        JSONObject extra = new JSONObject(response.toString()).put("secret", "leak");
+        extra.put("checksum", checksumWithout(extra, "checksum"));
+        assertThrows(IllegalArgumentException.class, () ->
+            LifecycleControlCodec.validateBackupReceiptResponse(
+                extra, repeatHex('d'), "yuqi", "device-1", 1784400000100L));
+    }
+
+    @Test
     public void roleDeleteShapeUsesNullSequenceFieldsAndClosedBackupReceipt() throws Exception {
         JSONObject receipt = backupReceipt("yuqi", 1L);
         LifecycleControlCodec.Encoded encoded = LifecycleControlCodec.encodeRoleDelete(
@@ -116,6 +144,12 @@ public class LifecycleControlCodecTest {
         assertEquals("conversation-clear-redacted-v1", outcome.getJSONObject("result").getString("contract"));
         assertEquals(3L, outcome.getJSONObject("result").getLong("clearEpoch"));
         assertEquals(7L, outcome.getJSONObject("result").getLong("clearedThroughSequence"));
+    }
+
+    private static String checksumWithout(JSONObject value, String field) throws Exception {
+        JSONObject basis = new JSONObject(value.toString());
+        basis.remove(field);
+        return BridgeAuthority.sha256CanonicalJson(basis);
     }
 
     private static String repeatHex(char value) {

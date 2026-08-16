@@ -120,7 +120,8 @@ test('runtime uses native proxy-aware fetch only for explicit proxy mode', () =>
 test('runtime wires the authenticated Android backup endpoint to the verified snapshot authority', () => {
   const main = readFileSync('yuqi-runtime/src/main.mjs', 'utf8');
   assert.match(main, /import \{ createVerifiedYuqiBackup \} from '\.\.\/\.\.\/scripts\/backup-yuqi-memory\.mjs'/);
-  assert.match(main, /createVerifiedBackup:\s*\(\{ roleId, requestedAt, androidRoomHead \}\)\s*=>/);
+  assert.match(main, /const createVerifiedBackup = \(\{ roleId, requestedAt, androidRoomHead \}\) =>/);
+  assert.equal((main.match(/\n  createVerifiedBackup,/g) || []).length, 2);
   for (const field of ['databasePath', 'snapshotsDir', 'roleId', 'createdAt: requestedAt', 'androidRoomHead']) {
     assert.match(main, new RegExp(field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }

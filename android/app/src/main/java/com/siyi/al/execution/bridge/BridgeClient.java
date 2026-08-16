@@ -179,7 +179,9 @@ public final class BridgeClient {
     public JSONObject requestVerifiedBackup(
         String roleId, JSONObject androidRoomHead, long requestedAt
     ) throws Exception {
-        if (!config.hasLan()) throw new BridgeFinalException("LAN_BRIDGE_NOT_CONFIGURED", false);
+        if (!config.hasLan() && !config.hasCloud()) {
+            throw new BridgeFinalException("VERIFIED_BACKUP_BRIDGE_NOT_CONFIGURED", false);
+        }
         if (roleId == null || !roleId.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
             || config.deviceId == null
             || !config.deviceId.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
@@ -190,7 +192,7 @@ public final class BridgeClient {
         if (head.getLong("capturedAt") != requestedAt) {
             throw new IllegalArgumentException("Yuqi backup request Room time conflict");
         }
-        JSONObject request = new JSONObject()
+        JSONObject backupRequest = new JSONObject()
             .put("protocolVersion", 3)
             .put("type", "YUQI_BACKUP_REQUEST")
             .put("requestVersion", "yuqi-backup-request-v1")
@@ -198,16 +200,99 @@ public final class BridgeClient {
             .put("peerId", config.deviceId)
             .put("requestedAt", requestedAt)
             .put("androidRoomHead", head);
-        request.put("checksum", BridgeAuthority.sha256CanonicalJson(request));
-        HttpResult response = signedLan("POST", "/v3/backups/yuqi", request.toString());
-        requireSuccess(response, "LAN verified backup");
-        JSONObject receipt = LifecycleControlCodec.validateBackupReceipt(
-            new JSONObject(response.body == null ? "{}" : response.body));
+        backupRequest.put("checksum", BridgeAuthority.sha256CanonicalJson(backupRequest));
+        if (config.hasLan()) {
+            try {
+                HttpResult response = signedLan(
+                    "POST", "/v3/backups/yuqi", backupRequest.toString());
+                requireSuccess(response, "LAN verified backup");
+                return validateVerifiedBackupReceipt(
+                    new JSONObject(response.body == null ? "{}" : response.body),
+                    roleId, requestedAt);
+            } catch (BridgePendingException error) {
+                if (!config.hasCloud()) throw error;
+            }
+        }
+        return requestVerifiedBackupCloud(backupRequest);
+    }
+
+    private JSONObject validateVerifiedBackupReceipt(
+        JSONObject value, String roleId, long requestedAt
+    ) throws Exception {
+        JSONObject receipt = LifecycleControlCodec.validateBackupReceipt(value);
         if (!roleId.equals(receipt.getString("roleId"))
             || receipt.getLong("createdAt") != requestedAt) {
             throw new IllegalArgumentException("Yuqi backup receipt authority conflict");
         }
         return receipt;
+    }
+
+    private JSONObject requestVerifiedBackupCloud(JSONObject backupRequest) throws Exception {
+        String requestChecksum = backupRequest.getString("checksum");
+        String relayMessageId = "bkreq_" + sha256(
+            "android-backup-request-message-id-v1\n" + requestChecksum).substring(0, 24);
+        String idempotencyKey = "bkreqidem_" + sha256(
+            "android-backup-request-idempotency-v1\n" + requestChecksum).substring(0, 24);
+        Encrypted encrypted = encryptLifecycle(backupRequest.toString(), relayMessageId);
+        long now = clock.now();
+        long expiresAt = now + 24L * 60L * 60L * 1000L;
+        if (expiresAt <= now || expiresAt > LifecycleControlSender.MAX_SAFE_INTEGER) {
+            throw new IllegalArgumentException("cloud Yuqi backup expiry conflict");
+        }
+        JSONObject enqueue = new JSONObject()
+            .put("deviceId", config.deviceId)
+            .put("messageId", relayMessageId)
+            .put("idempotencyKey", idempotencyKey)
+            .put("direction", "phone_to_pc")
+            .put("ciphertext", encrypted.ciphertext)
+            .put("nonce", encrypted.nonce)
+            .put("expiresAt", expiresAt);
+        HttpResult enqueued = request(
+            "POST", config.cloudUrl + "/bridge/enqueue", enqueue.toString(), bearerHeaders());
+        requireSuccess(enqueued, "cloud Yuqi backup enqueue");
+        validateLifecycleEnqueueResponse(enqueued.body, relayMessageId);
+
+        int interval = Math.max(100, config.cloudPollIntervalMs);
+        // A verified backup copies and validates the PC database before the
+        // receipt exists. Keep the synchronous waiter alive long enough for a
+        // real vault while still respecting the configured poll-attempt cap.
+        int attempts = Math.max(1, Math.min(config.cloudPollAttempts, 90_000 / interval));
+        String pollTarget = config.cloudUrl + "/bridge/poll?deviceId="
+            + URLEncoder.encode(config.deviceId, "UTF-8")
+            + "&direction=pc_to_phone&limit=50";
+        for (int attempt = 0; attempt < attempts; attempt++) {
+            HttpResult polled = request("GET", pollTarget, "", bearerHeaders());
+            requireSuccess(polled, "cloud Yuqi backup poll");
+            JSONArray messages = new JSONObject(polled.body == null ? "{}" : polled.body)
+                .optJSONArray("messages");
+            JSONArray normalized = normalizeCloudPollBatch(
+                messages == null ? new JSONArray() : messages, config.deviceId, clock.now());
+            for (int index = 0; index < normalized.length(); index++) {
+                JSONObject item = normalized.getJSONObject(index);
+                JSONObject decoded;
+                try {
+                    decoded = new JSONObject(decrypt(
+                        item.getString("ciphertext"), item.getString("nonce")));
+                } catch (Exception ignored) {
+                    continue;
+                }
+                if (!"YUQI_BACKUP_RECEIPT".equals(decoded.opt("type"))
+                    || !requestChecksum.equals(decoded.opt("requestChecksum"))) {
+                    continue;
+                }
+                JSONObject receipt = LifecycleControlCodec.validateBackupReceiptResponse(
+                    decoded,
+                    requestChecksum,
+                    backupRequest.getString("roleId"),
+                    backupRequest.getString("peerId"),
+                    backupRequest.getLong("requestedAt")
+                );
+                acknowledgeCloud(item.getString("messageId"));
+                return receipt;
+            }
+            if (attempt + 1 < attempts) sleeper.sleep(interval);
+        }
+        throw new BridgePendingException("电脑仍在处理备份凭证，请稍后重试完整恢复");
     }
 
     static boolean matchesTurn(TurnSubmission submission, String remoteTurnId) {
@@ -558,6 +643,11 @@ public final class BridgeClient {
         String relayMessageId = item == null ? "" : item.optString("messageId", "").trim();
         if (relayMessageId.isEmpty() || decoded == null) return false;
         rejectPredeclaredTransportMetadata(decoded);
+        if (isYuqiBackupReceiptCandidate(decoded)) {
+            // The synchronous verified-backup waiter owns this response.  The
+            // ordinary inbox drain must leave it queued and unacknowledged.
+            return false;
+        }
         if (isLifecycleControlCandidate(decoded)) {
             Object rawExpiry = item.opt("expiresAt");
             Long relayExpiresAt = null;
@@ -627,6 +717,13 @@ public final class BridgeClient {
         };
         for (String marker : markers) if (value.has(marker)) return true;
         return false;
+    }
+
+    private static boolean isYuqiBackupReceiptCandidate(JSONObject value) {
+        if (value == null) return false;
+        return "YUQI_BACKUP_RECEIPT".equals(value.opt("type"))
+            || value.has("requestChecksum")
+            || value.has("receipt") && value.has("requestedAt");
     }
 
     private static boolean isLifecycleControlCandidate(JSONObject value) {

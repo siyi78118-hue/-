@@ -76,6 +76,14 @@ const explicitProxy = config.cloudRelay?.proxy?.enabled === true;
 const cloudFetch = config.cloudRelay?.enabled
   ? (explicitProxy ? globalThis.fetch : createSystemCloudFetch())
   : null;
+const createVerifiedBackup = ({ roleId, requestedAt, androidRoomHead }) =>
+  createVerifiedYuqiBackup({
+    databasePath,
+    snapshotsDir,
+    roleId,
+    createdAt: requestedAt,
+    androidRoomHead
+  });
 const resultOutbox = config.cloudRelay?.enabled ? new ResultOutbox({
   relayUrl: config.cloudRelay.url,
   deviceId: config.cloudRelay.deviceId,
@@ -94,6 +102,7 @@ let cloudPump = config.cloudRelay?.enabled ? new CloudRelayPump({
   store,
   outbox: resultOutbox,
   reconciler,
+  createVerifiedBackup,
   fetchImpl: cloudFetch,
   proxyEnabled: explicitProxy
 }) : null;
@@ -103,14 +112,7 @@ const server = createYuqiServer({
   orchestrator,
   dispatcher,
   reconciler,
-  createVerifiedBackup: ({ roleId, requestedAt, androidRoomHead }) =>
-    createVerifiedYuqiBackup({
-      databasePath,
-      snapshotsDir,
-      roleId,
-      createdAt: requestedAt,
-      androidRoomHead
-    }),
+  createVerifiedBackup,
   getCloudRelayStatus: () => cloudPump?.status() || {
     enabled: false,
     proxyEnabled: explicitProxy,

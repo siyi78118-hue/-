@@ -17,8 +17,78 @@ import {
   validateRoleDeletePending,
   validateEnvelope
 } from '../src/protocol.mjs';
+import * as protocol from '../src/protocol.mjs';
 import { deriveAuthorityLineageKey, YuqiStore } from '../src/store.mjs';
 import { publicTurnStatus } from '../src/turn-status.mjs';
+
+function validYuqiBackupReceiptResponse(overrides = {}) {
+  const receipt = {
+    receiptVersion: 'yuqi-backup-receipt-v1',
+    receiptId: '',
+    roleId: 'char_1783694247588_zojx',
+    manifestChecksum: 'a'.repeat(64),
+    snapshotSha256: 'b'.repeat(64),
+    logicalChecksum: 'c'.repeat(64),
+    createdAt: 1786900000000,
+    receiptChecksum: ''
+  };
+  receipt.receiptId = `bkrcpt_${contentHash({
+    contract: 'yuqi-backup-receipt-id-v1',
+    roleId: receipt.roleId,
+    manifestChecksum: receipt.manifestChecksum,
+    snapshotSha256: receipt.snapshotSha256,
+    logicalChecksum: receipt.logicalChecksum,
+    createdAt: receipt.createdAt
+  }).slice(0, 24)}`;
+  const receiptWithoutChecksum = { ...receipt };
+  delete receiptWithoutChecksum.receiptChecksum;
+  receipt.receiptChecksum = contentHash(receiptWithoutChecksum);
+  const body = {
+    protocolVersion: 3,
+    type: 'YUQI_BACKUP_RECEIPT',
+    requestChecksum: 'd'.repeat(64),
+    roleId: receipt.roleId,
+    peerId: 'phone_cloud',
+    requestedAt: receipt.createdAt,
+    receipt,
+    ...overrides
+  };
+  return { ...body, checksum: contentHash(body) };
+}
+
+test('cloud Yuqi backup receipt response is closed and binds the persisted receipt to its request', () => {
+  assert.equal(typeof protocol.validateYuqiBackupReceiptResponse, 'function');
+  const valid = validYuqiBackupReceiptResponse();
+  assert.deepEqual(protocol.validateYuqiBackupReceiptResponse(valid, {
+    requestChecksum: valid.requestChecksum,
+    roleId: valid.roleId,
+    peerId: valid.peerId,
+    requestedAt: valid.requestedAt
+  }), valid);
+  for (const [label, changes] of [
+    ['extra key', { extra: 'leak' }],
+    ['foreign role', { roleId: 'yuqi' }],
+    ['foreign peer', { peerId: 'phone_other' }],
+    ['changed request checksum', { requestChecksum: 'e'.repeat(64) }],
+    ['string requestedAt', { requestedAt: '1786900000000' }],
+    ['changed receipt', { receipt: { ...valid.receipt, roleId: 'yuqi' } }]
+  ]) {
+    const candidate = { ...valid, ...changes };
+    const withoutChecksum = { ...candidate };
+    delete withoutChecksum.checksum;
+    candidate.checksum = contentHash(withoutChecksum);
+    assert.throws(
+      () => protocol.validateYuqiBackupReceiptResponse(candidate, {
+        requestChecksum: valid.requestChecksum,
+        roleId: valid.roleId,
+        peerId: valid.peerId,
+        requestedAt: valid.requestedAt
+      }),
+      /backup receipt/i,
+      label
+    );
+  }
+});
 
 function validConversationClearControl(overrides = {}) {
   const body = {

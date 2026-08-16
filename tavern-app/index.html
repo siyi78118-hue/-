@@ -13597,7 +13597,7 @@ async function nativeFirstRoleDelete(charId, { plugin = nativeExecutionPlugin() 
   const backupReceipt = await nativeBridgeCall(
     plugin.requestVerifiedYuqiBackup({ characterId: charId }),
     'requestVerifiedYuqiBackup',
-    15000
+    95000
   );
   if (!backupReceipt || typeof backupReceipt !== 'object' || Array.isArray(backupReceipt)) {
     throw new Error('invalid verified backup receipt');

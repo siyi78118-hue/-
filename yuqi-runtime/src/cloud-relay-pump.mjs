@@ -9,7 +9,10 @@ import {
   validateEnvelope,
   validateRoleDeleteApplied,
   validateRoleDeleteControl,
-  validateRoleDeletePending
+  validateRoleDeletePending,
+  validateYuqiBackupReceipt,
+  validateYuqiBackupReceiptResponse,
+  validateYuqiBackupRequest
 } from './protocol.mjs';
 import { normalizeRecoverySnapshot } from './reconcile.mjs';
 
@@ -52,6 +55,55 @@ function isRoleDeleteCandidate(value) {
   return value.type === 'ROLE_DELETE'
     || value.controlVersion === 'role_delete_v1'
     || Object.prototype.hasOwnProperty.call(value, 'backupReceipt');
+}
+
+function isYuqiBackupRequestCandidate(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return value.type === 'YUQI_BACKUP_REQUEST'
+    || value.requestVersion === 'yuqi-backup-request-v1'
+    || Object.prototype.hasOwnProperty.call(value, 'androidRoomHead');
+}
+
+function deriveYuqiBackupResponse(request, receipt, encryptionKeyBase64, now) {
+  const basis = {
+    protocolVersion: 3,
+    type: 'YUQI_BACKUP_RECEIPT',
+    requestChecksum: request.checksum,
+    roleId: request.roleId,
+    peerId: request.peerId,
+    requestedAt: request.requestedAt,
+    receipt: validateYuqiBackupReceipt(receipt)
+  };
+  const response = validateYuqiBackupReceiptResponse(
+    { ...basis, checksum: contentHash(basis) },
+    {
+      requestChecksum: request.checksum,
+      roleId: request.roleId,
+      peerId: request.peerId,
+      requestedAt: request.requestedAt
+    }
+  );
+  const messageId = stableId(
+    'bkack', `pc-backup-response-message-id-v1\n${request.checksum}\n${response.checksum}`
+  );
+  const idempotencyKey = stableId(
+    'bkackidem', `pc-backup-response-idempotency-v1\n${request.checksum}\n${response.checksum}`
+  );
+  const nonce = createHmac('sha256', keyBytes(encryptionKeyBase64))
+    .update(`pc-backup-response-gcm-nonce-v1\n${messageId}`, 'utf8')
+    .digest().subarray(0, 12);
+  const expiresAt = now + 24 * 60 * 60 * 1000;
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= now) {
+    throw new Error('invalid Yuqi backup response expiry');
+  }
+  return {
+    deviceId: request.peerId,
+    messageId,
+    direction: 'pc_to_phone',
+    ...encryptSerializedRelayPayload(canonicalJson(response), encryptionKeyBase64, nonce),
+    idempotencyKey,
+    expiresAt
+  };
 }
 
 function deriveConversationClearResponse(proof, encryptionKeyBase64, now) {
@@ -131,6 +183,7 @@ export class CloudRelayPump {
     store = null,
     outbox = null,
     reconciler = null,
+    createVerifiedBackup = null,
     proxyEnabled = false,
     fetchImpl = globalThis.fetch,
     clock = Date.now
@@ -152,6 +205,7 @@ export class CloudRelayPump {
     this.store = store;
     this.outbox = outbox;
     this.reconciler = reconciler;
+    this.createVerifiedBackup = createVerifiedBackup;
     this.proxyEnabled = proxyEnabled === true;
     this.fetch = fetchImpl;
     this.clock = clock;
@@ -239,6 +293,53 @@ export class CloudRelayPump {
         let envelope = null;
         try {
           const rawEnvelope = decryptRelayPayload(message, this.encryptionKeyBase64);
+          if (isYuqiBackupRequestCandidate(rawEnvelope)) {
+            let backupRequest;
+            try {
+              backupRequest = validateYuqiBackupRequest(rawEnvelope);
+              if (backupRequest.peerId !== this.deviceId
+                || backupRequest.requestedAt > this.clock()
+                || this.clock() - backupRequest.requestedAt > 24 * 60 * 60 * 1000) {
+                throw new Error('Yuqi backup request cloud authority conflict');
+              }
+            } catch (error) {
+              error.suppressStoreDiagnostic = true;
+              throw error;
+            }
+            if (typeof this.createVerifiedBackup !== 'function') {
+              throw new Error('verified backup service is unavailable');
+            }
+            const result = await this.createVerifiedBackup({
+              roleId: backupRequest.roleId,
+              peerId: backupRequest.peerId,
+              requestedAt: backupRequest.requestedAt,
+              androidRoomHead: backupRequest.androidRoomHead
+            });
+            const responseEnvelope = deriveYuqiBackupResponse(
+              backupRequest, result?.receipt, this.encryptionKeyBase64, this.clock()
+            );
+            const exchanged = await this.fetch(`${this.relayUrl}/bridge/ack-with-response`, {
+              method: 'POST', headers: this.headers(true),
+              body: JSON.stringify({
+                deviceId: this.deviceId,
+                incomingMessageId: message.messageId,
+                response: responseEnvelope
+              })
+            });
+            if (!exchanged.ok) throw new Error(`cloud relay backup exchange HTTP ${exchanged.status}`);
+            const exchangeBody = await exchanged.json();
+            const exchangeKeys = exchangeBody && typeof exchangeBody === 'object' && !Array.isArray(exchangeBody)
+              ? Object.keys(exchangeBody).sort() : [];
+            if (JSON.stringify(exchangeKeys) !== JSON.stringify(['idempotent', 'incomingMessageId', 'ok', 'responseMessageId'])
+              || exchangeBody.ok !== true
+              || exchangeBody.incomingMessageId !== message.messageId
+              || exchangeBody.responseMessageId !== responseEnvelope.messageId
+              || typeof exchangeBody.idempotent !== 'boolean') {
+              throw new Error('invalid cloud Yuqi backup exchange response');
+            }
+            summary.processed += 1;
+            continue;
+          }
           if (isRoleDeleteCandidate(rawEnvelope)) {
             let control;
             try {
