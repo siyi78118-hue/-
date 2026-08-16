@@ -13876,9 +13876,34 @@ function compareAppRecoveryCursor(leftSentAt, leftMessageId, rightSentAt, rightM
   return leftMessageId < rightMessageId ? -1 : 1;
 }
 
+async function readCompleteNativeRecoveryEvidence(plugin, characterId) {
+  const replyParts = await CompleteAppRestoration.readAllNativeRecoveryPages(
+    plugin, 'readAppRecoveryReplyParts', characterId, { limit: 100 });
+  const memoryRows = await CompleteAppRestoration.readAllNativeRecoveryPages(
+    plugin, 'readAppRecoveryMemoryRecords', characterId, { limit: 100 });
+  const rolePlanRows = await CompleteAppRestoration.readAllNativeRecoveryPages(
+    plugin, 'readAppRecoveryRolePlans', characterId, { limit: 100 });
+  const momentRows = await CompleteAppRestoration.readAllNativeRecoveryPages(
+    plugin, 'readAppRecoveryMomentEvidence', characterId, { limit: 100 });
+  return {
+    snapshotTokens: {
+      replyParts: replyParts.snapshotToken,
+      memories: memoryRows.snapshotToken,
+      rolePlans: rolePlanRows.snapshotToken,
+      moments: momentRows.snapshotToken
+    },
+    reply: CompleteAppRestoration.mapNativeReplyEvidence(replyParts.rows),
+    memories: CompleteAppRestoration.mapNativeMemoryRows(memoryRows.rows),
+    rolePlans: CompleteAppRestoration.mapNativeRolePlanRows(rolePlanRows.rows),
+    moments: CompleteAppRestoration.mapNativeMomentRows(momentRows.rows)
+  };
+}
+
 async function readNativeAppStateRecoveryCandidate(recoveryDecision) {
   const plugin = nativeExecutionPlugin();
-  if (!plugin?.readAppRecoveryRoleCandidate || !plugin?.readAppRecoveryMessages) {
+  if (!plugin?.readAppRecoveryRoleCandidate || !plugin?.readAppRecoveryMessages
+    || !plugin?.readAppRecoveryReplyParts || !plugin?.readAppRecoveryMemoryRecords
+    || !plugin?.readAppRecoveryRolePlans || !plugin?.readAppRecoveryMomentEvidence) {
     throw new Error('APP_STATE_RECOVERY_NATIVE_READER_UNAVAILABLE');
   }
   const roles = (recoveryDecision.native?.roles || []).filter(role => role?.candidateAvailable === true);
@@ -13887,6 +13912,7 @@ async function readNativeAppStateRecoveryCandidate(recoveryDecision) {
   }
   const recoveredCharacters = [];
   const recoveredChats = {};
+  let nativeEvidence = null;
   let recoveredPlayerName = '';
   for (const roleEvidence of roles) {
     const characterId = String(roleEvidence.characterId || '');
@@ -13978,12 +14004,16 @@ async function readNativeAppStateRecoveryCandidate(recoveryDecision) {
       unread: 0,
       recoveryPresentationIncomplete: true
     };
+    if (characterId === 'yuqi') {
+      nativeEvidence = await readCompleteNativeRecoveryEvidence(plugin, characterId);
+    }
   }
   return {
     settings: recoveredPlayerName ? { playerName: recoveredPlayerName } : {},
     characters: recoveredCharacters,
     allChats: recoveredChats,
     allMoments: [],
+    nativeEvidence,
     updatedAt: Date.now()
   };
 }

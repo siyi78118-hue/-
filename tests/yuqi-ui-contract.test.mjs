@@ -1907,6 +1907,23 @@ test('complete phone recovery loads its closed source collector before the app s
   assert.match(recovery, /YUQI_FIRST_PROFILE/);
 });
 
+test('complete recovery drains each closed native category before building the Web candidate', () => {
+  const recovery = html.slice(
+    html.indexOf('const APP_RECOVERY_JOURNAL_DB'),
+    html.indexOf('async function syncFromServiceWorkerState')
+  );
+  for (const method of [
+    'readAppRecoveryReplyParts',
+    'readAppRecoveryMemoryRecords',
+    'readAppRecoveryRolePlans',
+    'readAppRecoveryMomentEvidence'
+  ]) assert.match(recovery, new RegExp(method));
+  assert.match(recovery, /readAllNativeRecoveryPages/);
+  assert.match(recovery, /mapNativeReplyEvidence/);
+  assert.match(recovery, /mapNativeMemoryRows/);
+  assert.match(recovery, /mapNativeRolePlanRows/);
+});
+
 test('MemoryDB upgrade never deletes an existing meta store during recovery', () => {
   const open = html.slice(html.indexOf('async open()'), html.indexOf('readFallback()'));
   assert.doesNotMatch(open, /deleteObjectStore\('meta'\)/);

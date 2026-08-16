@@ -24,11 +24,86 @@
     ['pre_recovery_mirror', 'preRecoveryMirror'],
     ['current_mirror', 'mirror']
   ]);
+  const NATIVE_PAGE_METHODS = Object.freeze({
+    readAppRecoveryReplyParts: {
+      contract: 'android-app-recovery-reply-part-v1', timeKey: 'createdAt', idKey: 'replyPartId'
+    },
+    readAppRecoveryMemoryRecords: {
+      contract: 'android-app-recovery-memory-v1', timeKey: 'updatedAt', idKey: 'memoryId'
+    },
+    readAppRecoveryRolePlans: {
+      contract: 'android-app-recovery-role-plan-v1', timeKey: 'updatedAt', idKey: 'planId'
+    },
+    readAppRecoveryMomentEvidence: {
+      contract: 'android-app-recovery-moment-evidence-v1', timeKey: 'createdAt', idKey: 'replyPartId'
+    }
+  });
+  const NATIVE_ROW_KEYS = Object.freeze({
+    'android-app-recovery-reply-part-v1': Object.freeze([
+      'replyPartId', 'turnId', 'attemptId', 'sequence', 'type', 'content',
+      'payload', 'createdAt', 'sourceChecksum'
+    ]),
+    'android-app-recovery-moment-evidence-v1': Object.freeze([
+      'replyPartId', 'turnId', 'attemptId', 'sequence', 'type', 'content',
+      'payload', 'createdAt', 'sourceChecksum'
+    ]),
+    'android-app-recovery-memory-v1': Object.freeze([
+      'memoryId', 'sourceKey', 'characterId', 'type', 'title', 'content',
+      'vectorJson', 'eventTime', 'createdAt', 'updatedAt', 'manual', 'sourceChecksum'
+    ]),
+    'android-app-recovery-role-plan-v1': Object.freeze([
+      'planId', 'characterId', 'status', 'planJson', 'nextRunAt',
+      'updatedAt', 'history', 'sourceChecksum'
+    ])
+  });
+  const LOSSLESS_REPLY_ACTION_TYPES = Object.freeze(new Set([
+    'PAYMENT_STATUS', 'MOMENT_CREATE', 'MOMENT_ACTION', 'PLAN', 'LIFE_EPISODE',
+    'LIFE_ADJUSTMENT', 'RELATIONSHIP_STAGE', 'SCHEDULE'
+  ]));
 
   function clone(value) {
     if (value === undefined) return undefined;
     if (typeof structuredClone === 'function') return structuredClone(value);
     return JSON.parse(JSON.stringify(value));
+  }
+
+  function canonicalJson(value) {
+    if (value === null) return 'null';
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+    if (typeof value === 'object') {
+      return `{${Object.keys(value).sort().filter(key => value[key] !== undefined)
+        .map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+    }
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) throw new Error('APP_RESTORATION_CANONICAL_NUMBER_INVALID');
+      return JSON.stringify(value);
+    }
+    if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+    throw new Error('APP_RESTORATION_CANONICAL_VALUE_INVALID');
+  }
+
+  async function sha256CanonicalJson(value) {
+    const text = canonicalJson(value);
+    if (typeof globalThis !== 'undefined' && globalThis.crypto?.subtle) {
+      const bytes = new TextEncoder().encode(text);
+      const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+      return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+    }
+    if (typeof require === 'function') {
+      return require('node:crypto').createHash('sha256').update(text, 'utf8').digest('hex');
+    }
+    throw new Error('APP_RESTORATION_SHA256_UNAVAILABLE');
+  }
+
+  function assertExactKeys(value, keys, code) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).sort().join(',') !== [...keys].sort().join(',')) {
+      throw new Error(code);
+    }
+  }
+
+  function requireSafeInteger(value, code) {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error(code);
   }
 
   function deepFreeze(value) {
@@ -174,6 +249,269 @@
       }
     }
     return null;
+  }
+
+  async function verifyNativeHistoryRow(row) {
+    assertExactKeys(row, [
+      'historyId', 'planId', 'historyJson', 'createdAt', 'sourceChecksum'
+    ], 'APP_RESTORATION_NATIVE_HISTORY_SHAPE_CONFLICT');
+    if (typeof row.historyId !== 'string' || !row.historyId
+      || typeof row.planId !== 'string' || !row.planId
+      || !row.historyJson || typeof row.historyJson !== 'object' || Array.isArray(row.historyJson)
+      || !/^[0-9a-f]{64}$/.test(row.sourceChecksum || '')) {
+      throw new Error('APP_RESTORATION_NATIVE_HISTORY_SHAPE_CONFLICT');
+    }
+    requireSafeInteger(row.createdAt, 'APP_RESTORATION_NATIVE_HISTORY_SHAPE_CONFLICT');
+    const basis = clone(row);
+    delete basis.sourceChecksum;
+    if (await sha256CanonicalJson(basis) !== row.sourceChecksum) {
+      throw new Error('APP_RESTORATION_NATIVE_HISTORY_CHECKSUM_CONFLICT');
+    }
+  }
+
+  async function verifyNativeRow(row, contract) {
+    const keys = NATIVE_ROW_KEYS[contract];
+    if (!keys) throw new Error('APP_RESTORATION_NATIVE_CONTRACT_CONFLICT');
+    assertExactKeys(row, keys, 'APP_RESTORATION_NATIVE_ROW_SHAPE_CONFLICT');
+    if (!/^[0-9a-f]{64}$/.test(row.sourceChecksum || '')) {
+      throw new Error('APP_RESTORATION_NATIVE_ROW_CHECKSUM_CONFLICT');
+    }
+    if (contract === 'android-app-recovery-reply-part-v1'
+      || contract === 'android-app-recovery-moment-evidence-v1') {
+      for (const key of ['replyPartId', 'turnId', 'attemptId', 'type']) {
+        if (typeof row[key] !== 'string' || !row[key]) {
+          throw new Error('APP_RESTORATION_NATIVE_ROW_SHAPE_CONFLICT');
+        }
+      }
+      if (typeof row.content !== 'string' || !row.payload || typeof row.payload !== 'object'
+        || Array.isArray(row.payload)) {
+        throw new Error('APP_RESTORATION_NATIVE_ROW_SHAPE_CONFLICT');
+      }
+      requireSafeInteger(row.sequence, 'APP_RESTORATION_NATIVE_ROW_SHAPE_CONFLICT');
+      requireSafeInteger(row.createdAt, 'APP_RESTORATION_NATIVE_ROW_SHAPE_CONFLICT');
+      if (contract === 'android-app-recovery-moment-evidence-v1'
+        && row.type !== 'MOMENT_CREATE' && row.type !== 'MOMENT_ACTION') {
+        throw new Error('APP_RESTORATION_NATIVE_ROW_SHAPE_CONFLICT');
+      }
+    } else if (contract === 'android-app-recovery-memory-v1') {
+      for (const key of ['memoryId', 'sourceKey', 'characterId', 'type', 'title', 'content', 'vectorJson']) {
+        if (typeof row[key] !== 'string' || (key !== 'title' && key !== 'content' && !row[key])) {
+          throw new Error('APP_RESTORATION_NATIVE_ROW_SHAPE_CONFLICT');
+        }
+      }
+      if (!['EVENT', 'SUMMARY', 'PROFILE'].includes(row.type) || typeof row.manual !== 'boolean') {
+        throw new Error('APP_RESTORATION_NATIVE_ROW_SHAPE_CONFLICT');
+      }
+      for (const key of ['eventTime', 'createdAt', 'updatedAt']) {
+        requireSafeInteger(row[key], 'APP_RESTORATION_NATIVE_ROW_SHAPE_CONFLICT');
+      }
+    } else {
+      for (const key of ['planId', 'characterId', 'status']) {
+        if (typeof row[key] !== 'string' || !row[key]) {
+          throw new Error('APP_RESTORATION_NATIVE_ROW_SHAPE_CONFLICT');
+        }
+      }
+      if (!row.planJson || typeof row.planJson !== 'object' || Array.isArray(row.planJson)
+        || !Array.isArray(row.history)
+        || (row.nextRunAt !== null && (!Number.isSafeInteger(row.nextRunAt) || row.nextRunAt < 0))) {
+        throw new Error('APP_RESTORATION_NATIVE_ROW_SHAPE_CONFLICT');
+      }
+      requireSafeInteger(row.updatedAt, 'APP_RESTORATION_NATIVE_ROW_SHAPE_CONFLICT');
+      for (const history of row.history) await verifyNativeHistoryRow(history);
+    }
+    const basis = clone(row);
+    delete basis.sourceChecksum;
+    if (await sha256CanonicalJson(basis) !== row.sourceChecksum) {
+      throw new Error('APP_RESTORATION_NATIVE_ROW_CHECKSUM_CONFLICT');
+    }
+    return clone(row);
+  }
+
+  async function verifyNativePage(page, contract, characterId = 'yuqi') {
+    assertExactKeys(page, [
+      'contract', 'characterId', 'snapshotToken', 'nextCursor',
+      'hasMore', 'rows', 'pageChecksum'
+    ], 'APP_RESTORATION_NATIVE_PAGE_SHAPE_CONFLICT');
+    if (page.contract !== contract || page.characterId !== characterId
+      || !/^sha256:[0-9a-f]{64}$/.test(page.snapshotToken || '')
+      || typeof page.hasMore !== 'boolean' || !Array.isArray(page.rows)
+      || !/^[0-9a-f]{64}$/.test(page.pageChecksum || '')) {
+      throw new Error('APP_RESTORATION_NATIVE_PAGE_SHAPE_CONFLICT');
+    }
+    assertExactKeys(page.nextCursor, ['afterCreatedAt', 'afterId'],
+      'APP_RESTORATION_NATIVE_CURSOR_CONFLICT');
+    requireSafeInteger(page.nextCursor.afterCreatedAt,
+      'APP_RESTORATION_NATIVE_CURSOR_CONFLICT');
+    if (typeof page.nextCursor.afterId !== 'string') {
+      throw new Error('APP_RESTORATION_NATIVE_CURSOR_CONFLICT');
+    }
+    const basis = clone(page);
+    delete basis.pageChecksum;
+    if (await sha256CanonicalJson(basis) !== page.pageChecksum) {
+      throw new Error('APP_RESTORATION_NATIVE_PAGE_CHECKSUM_CONFLICT');
+    }
+    for (const row of page.rows) await verifyNativeRow(row, contract);
+    return clone(page);
+  }
+
+  function compareNativeCursor(leftTime, leftId, rightTime, rightId) {
+    if (leftTime !== rightTime) return leftTime < rightTime ? -1 : 1;
+    if (leftId === rightId) return 0;
+    return leftId < rightId ? -1 : 1;
+  }
+
+  async function readAllNativeRecoveryPages(
+    plugin, method, characterId, { limit = 100, maxRows = 100000 } = {}
+  ) {
+    const spec = NATIVE_PAGE_METHODS[method];
+    if (!spec || typeof plugin?.[method] !== 'function'
+      || !Number.isSafeInteger(limit) || limit < 1 || limit > 200
+      || !Number.isSafeInteger(maxRows) || maxRows < 1) {
+      throw new Error('APP_RESTORATION_NATIVE_READER_CONFLICT');
+    }
+    let cursor = { afterCreatedAt: 0, afterId: '' };
+    let snapshotToken = '';
+    const rows = [];
+    const identities = new Set();
+    for (let pageNumber = 0; pageNumber < 10000; pageNumber += 1) {
+      const page = await verifyNativePage(await plugin[method]({
+        characterId, ...cursor, limit
+      }), spec.contract, characterId);
+      if (snapshotToken && page.snapshotToken !== snapshotToken) {
+        throw new Error('APP_RESTORATION_NATIVE_SNAPSHOT_CHANGED');
+      }
+      snapshotToken = page.snapshotToken;
+      let lastTime = cursor.afterCreatedAt;
+      let lastId = cursor.afterId;
+      for (const row of page.rows) {
+        const rowTime = row[spec.timeKey];
+        const rowId = row[spec.idKey];
+        if (compareNativeCursor(rowTime, rowId, lastTime, lastId) <= 0
+          || identities.has(rowId)) {
+          throw new Error('APP_RESTORATION_NATIVE_CURSOR_CONFLICT');
+        }
+        identities.add(rowId);
+        rows.push(row);
+        lastTime = rowTime;
+        lastId = rowId;
+        if (rows.length > maxRows) throw new Error('APP_RESTORATION_PAGE_LIMIT_CONFLICT');
+      }
+      if (page.nextCursor.afterCreatedAt !== lastTime || page.nextCursor.afterId !== lastId
+        || (page.hasMore && page.rows.length === 0)) {
+        throw new Error('APP_RESTORATION_NATIVE_CURSOR_CONFLICT');
+      }
+      cursor = clone(page.nextCursor);
+      if (!page.hasMore) return deepFreeze({ snapshotToken, rows: clone(rows) });
+    }
+    throw new Error('APP_RESTORATION_PAGE_LIMIT_CONFLICT');
+  }
+
+  function mapNativeReplyEvidence(rows = []) {
+    const messages = [];
+    const actions = [];
+    const nativeOnly = [];
+    for (const row of rows) {
+      if (row.type === 'TEXT') {
+        messages.push({
+          id: row.replyPartId,
+          role: 'assistant',
+          content: row.content,
+          time: row.createdAt,
+          sourceTurnId: 'native:' + row.turnId,
+          nativeRecoveryChecksum: row.sourceChecksum
+        });
+      } else if (LOSSLESS_REPLY_ACTION_TYPES.has(row.type)) {
+        actions.push(clone(row));
+      } else {
+        nativeOnly.push(clone(row));
+      }
+    }
+    return deepFreeze({ messages, actions, nativeOnly });
+  }
+
+  function mapNativeMemoryRows(rows = []) {
+    const stores = { EVENT: 'events', SUMMARY: 'summaries', PROFILE: 'profiles' };
+    return deepFreeze(rows.map(row => {
+      let vector;
+      try { vector = JSON.parse(row.vectorJson); } catch {
+        throw new Error('APP_RESTORATION_NATIVE_MEMORY_VECTOR_CONFLICT');
+      }
+      if (!Array.isArray(vector) || vector.some(value => !Number.isFinite(value))) {
+        throw new Error('APP_RESTORATION_NATIVE_MEMORY_VECTOR_CONFLICT');
+      }
+      const common = {
+        id: row.memoryId,
+        charId: row.characterId,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+        manual: row.manual,
+        nativeRecoverySourceKey: row.sourceKey,
+        nativeRecoveryChecksum: row.sourceChecksum
+      };
+      const item = row.type === 'SUMMARY'
+        ? { ...common, content: row.content }
+        : {
+            ...common,
+            type: row.type === 'EVENT' ? 'fact' : 'profile',
+            title: row.title,
+            detail: row.content,
+            ...(row.type === 'EVENT' ? { happenedAt: row.eventTime } : {})
+          };
+      return { storeName: stores[row.type], item, vector };
+    }));
+  }
+
+  function mapNativeRolePlanRows(rows = []) {
+    const plans = [];
+    const history = [];
+    for (const row of rows) {
+      if ((row.planJson.planId && row.planJson.planId !== row.planId)
+        || (row.planJson.characterId && row.planJson.characterId !== row.characterId)) {
+        throw new Error('APP_RESTORATION_NATIVE_ROLE_PLAN_CONFLICT');
+      }
+      plans.push({
+        ...clone(row.planJson),
+        planId: row.planId,
+        characterId: row.characterId,
+        status: row.status,
+        nextRunAt: row.nextRunAt,
+        updatedAt: row.updatedAt,
+        nativeRecoveryChecksum: row.sourceChecksum
+      });
+      for (const record of row.history) {
+        if ((record.historyJson.historyId && record.historyJson.historyId !== record.historyId)
+          || (record.historyJson.planId && record.historyJson.planId !== row.planId)) {
+          throw new Error('APP_RESTORATION_NATIVE_ROLE_PLAN_CONFLICT');
+        }
+        history.push({
+          ...clone(record.historyJson),
+          historyId: record.historyId,
+          planId: row.planId,
+          createdAt: record.createdAt,
+          nativeRecoveryChecksum: record.sourceChecksum
+        });
+      }
+    }
+    return deepFreeze({ plans, history });
+  }
+
+  function mapNativeMomentRows(rows = []) {
+    const creates = [];
+    const actions = [];
+    const nativeOnly = [];
+    for (const row of rows) {
+      if (row.type === 'MOMENT_CREATE') {
+        const id = String(row.payload?.momentId || '');
+        if (!id) throw new Error('APP_RESTORATION_NATIVE_MOMENT_IDENTITY_CONFLICT');
+        creates.push({
+          ...clone(row.payload), id, verified: true,
+          nativeRecoveryEvidenceId: row.replyPartId,
+          nativeRecoveryChecksum: row.sourceChecksum
+        });
+      } else if (row.type === 'MOMENT_ACTION') actions.push(clone(row));
+      else nativeOnly.push(clone(row));
+    }
+    return deepFreeze({ creates, actions, nativeOnly });
   }
 
   function mergeRoleByField(roleId, sources, fallback) {
@@ -323,6 +661,12 @@
     applyWebCandidate,
     collectWebRestorationSources,
     readVerifiedAvatarCandidate,
+    verifyNativePage,
+    readAllNativeRecoveryPages,
+    mapNativeReplyEvidence,
+    mapNativeMemoryRows,
+    mapNativeRolePlanRows,
+    mapNativeMomentRows,
     validAvatarData,
     CONFIRMED_DELETION_ID
   });

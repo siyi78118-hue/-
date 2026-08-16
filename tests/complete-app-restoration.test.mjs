@@ -250,3 +250,97 @@ test('pre-recovery mirror checksum mismatch rejects the complete source collecti
     sha256CanonicalJson: async () => '1'.repeat(64)
   }), /APP_RESTORATION_PRE_MIRROR_CHECKSUM_CONFLICT/);
 });
+
+async function checksummedRow(value) {
+  const { sha256CanonicalJson } = require('../tavern-app/lib/app-state-recovery.js');
+  return { ...value, sourceChecksum: await sha256CanonicalJson(value) };
+}
+
+async function nativePage(contract, rows, nextCursor, hasMore, snapshotToken = 'sha256:' + 'a'.repeat(64)) {
+  const { sha256CanonicalJson } = require('../tavern-app/lib/app-state-recovery.js');
+  const basis = { contract, characterId: 'yuqi', snapshotToken, nextCursor, hasMore, rows };
+  return { ...basis, pageChecksum: await sha256CanonicalJson(basis) };
+}
+
+test('native recovery page drain preserves three-page order and rejects snapshot or identity drift', async () => {
+  const { readAllNativeRecoveryPages } = restorationModule();
+  const rows = [
+    await checksummedRow({ replyPartId: 'part-1', turnId: 'turn-1', attemptId: 'attempt-1',
+      sequence: 0, type: 'TEXT', content: '第一泡', payload: {}, createdAt: 10 }),
+    await checksummedRow({ replyPartId: 'part-2', turnId: 'turn-1', attemptId: 'attempt-1',
+      sequence: 1, type: 'PAYMENT_STATUS', content: '', payload: { status: 'received' }, createdAt: 11 }),
+    await checksummedRow({ replyPartId: 'part-3', turnId: 'turn-2', attemptId: 'attempt-2',
+      sequence: 0, type: 'FUTURE_NATIVE_ACTION', content: '', payload: { retained: true }, createdAt: 12 })
+  ];
+  const pages = [
+    await nativePage('android-app-recovery-reply-part-v1', [rows[0]],
+      { afterCreatedAt: 10, afterId: 'part-1' }, true),
+    await nativePage('android-app-recovery-reply-part-v1', [rows[1]],
+      { afterCreatedAt: 11, afterId: 'part-2' }, true),
+    await nativePage('android-app-recovery-reply-part-v1', [rows[2]],
+      { afterCreatedAt: 12, afterId: 'part-3' }, false)
+  ];
+  const plugin = {
+    async readAppRecoveryReplyParts({ afterId }) {
+      return pages[afterId === '' ? 0 : afterId === 'part-1' ? 1 : 2];
+    }
+  };
+  const result = await readAllNativeRecoveryPages(
+    plugin, 'readAppRecoveryReplyParts', 'yuqi', { limit: 1 });
+  assert.deepEqual(result.rows.map(row => row.replyPartId), ['part-1', 'part-2', 'part-3']);
+  assert.equal(result.snapshotToken, 'sha256:' + 'a'.repeat(64));
+
+  const changed = structuredClone(pages);
+  changed[1] = await nativePage('android-app-recovery-reply-part-v1', [rows[1]],
+    { afterCreatedAt: 11, afterId: 'part-2' }, true, 'sha256:' + 'b'.repeat(64));
+  await assert.rejects(() => readAllNativeRecoveryPages({
+    async readAppRecoveryReplyParts({ afterId }) {
+      return changed[afterId === '' ? 0 : afterId === 'part-1' ? 1 : 2];
+    }
+  }, 'readAppRecoveryReplyParts', 'yuqi', { limit: 1 }),
+  /APP_RESTORATION_NATIVE_SNAPSHOT_CHANGED/);
+
+  const duplicate = structuredClone(pages);
+  duplicate[1] = await nativePage('android-app-recovery-reply-part-v1', [rows[0]],
+    { afterCreatedAt: 10, afterId: 'part-1' }, true);
+  await assert.rejects(() => readAllNativeRecoveryPages({
+    async readAppRecoveryReplyParts({ afterId }) { return duplicate[afterId === '' ? 0 : 1]; }
+  }, 'readAppRecoveryReplyParts', 'yuqi', { limit: 1 }),
+  /APP_RESTORATION_NATIVE_CURSOR_CONFLICT/);
+});
+
+test('native evidence mappers preserve lossless rows and report unsupported actions as native-only', async () => {
+  const { mapNativeReplyEvidence, mapNativeMemoryRows, mapNativeRolePlanRows } = restorationModule();
+  const replyRows = [
+    await checksummedRow({ replyPartId: 'part-text', turnId: 'turn-1', attemptId: 'attempt-1',
+      sequence: 0, type: 'TEXT', content: '正文', payload: {}, createdAt: 10 }),
+    await checksummedRow({ replyPartId: 'part-action', turnId: 'turn-1', attemptId: 'attempt-1',
+      sequence: 1, type: 'FUTURE_NATIVE_ACTION', content: '', payload: { exact: true }, createdAt: 11 })
+  ];
+  const reply = mapNativeReplyEvidence(replyRows);
+  assert.equal(reply.messages[0].id, 'part-text');
+  assert.equal(reply.nativeOnly[0].replyPartId, 'part-action');
+  assert.deepEqual(reply.nativeOnly[0].payload, { exact: true });
+
+  const memoryRow = await checksummedRow({
+    memoryId: 'memory-1', sourceKey: 'event:1', characterId: 'yuqi', type: 'EVENT',
+    title: '标题', content: '内容', vectorJson: '[0.25,-0.5]', eventTime: 12,
+    createdAt: 13, updatedAt: 14, manual: true
+  });
+  const memory = mapNativeMemoryRows([memoryRow]);
+  assert.equal(memory[0].storeName, 'events');
+  assert.deepEqual(memory[0].vector, [0.25, -0.5]);
+  assert.equal(memory[0].item.manual, true);
+
+  const planRow = await checksummedRow({
+    planId: 'plan-1', characterId: 'yuqi', status: 'active',
+    planJson: { planId: 'plan-1', characterId: 'yuqi', status: 'active' },
+    nextRunAt: 20, updatedAt: 21,
+    history: [{ historyId: 'history-1', planId: 'plan-1',
+      historyJson: { historyId: 'history-1', planId: 'plan-1' }, createdAt: 20,
+      sourceChecksum: 'c'.repeat(64) }]
+  });
+  const plans = mapNativeRolePlanRows([planRow]);
+  assert.equal(plans.plans[0].planId, 'plan-1');
+  assert.equal(plans.history[0].historyId, 'history-1');
+});
