@@ -8,6 +8,7 @@ const html = readFileSync('tavern-app/index.html', 'utf8');
 const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
 const apiEndpointHelper = readFileSync('tavern-app/lib/api-endpoint.js', 'utf8');
 const appStateRecoveryHelper = readFileSync('tavern-app/lib/app-state-recovery.js', 'utf8');
+const completeAppRestorationHelper = readFileSync('tavern-app/lib/complete-app-restoration.js', 'utf8');
 const rolePlanDomain = readFileSync('tavern-app/lib/role-plan-domain.js', 'utf8');
 const liveDirectorHelper = readFileSync('tavern-app/lib/live-chat-director.js', 'utf8');
 assert.ok(script, 'index.html should contain an inline app script');
@@ -906,7 +907,7 @@ const modelListFetch = context.fetch;
 context.window = {};
 
 vm.createContext(context);
-vm.runInContext(`${apiEndpointHelper}\n${appStateRecoveryHelper}\nwindow.ALAppStateRecovery = globalThis.ALAppStateRecovery;\n${liveDirectorHelper}\n${executableScript}
+vm.runInContext(`${apiEndpointHelper}\n${appStateRecoveryHelper}\nwindow.ALAppStateRecovery = globalThis.ALAppStateRecovery;\n${completeAppRestorationHelper}\nwindow.ALCompleteAppRestoration = globalThis.ALCompleteAppRestoration;\n${liveDirectorHelper}\n${executableScript}
 globalThis.__appTest = {
   parseCharacterCard,
   buildCharPrompt,

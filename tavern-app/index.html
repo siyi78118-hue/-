@@ -836,6 +836,7 @@ button.cell:active{background:#ececec}
           <div class="cell"><div class="cell-label">RP 预设</div><div class="cell-body"><select class="select" id="set-rp-preset" onchange="onPresetChange(this.value)"><option value="combined">AL 综合 RP</option><option value="custom">自定义</option></select><div class="hint" id="preset-desc" style="padding:6px 0 0"></div></div></div>
           <div class="cell"><div class="cell-label">全局预设</div><div class="cell-body"><textarea class="textarea" id="set-system-prompt"></textarea></div></div>
           <button class="cell" onclick="openMemory('settings')" type="button"><div class="cell-label">记忆库</div><div class="cell-body">本地向量数据库</div><div class="mini">›</div></button>
+          <button class="cell" id="complete-phone-restoration-row" onclick="openCompletePhoneRestoration()" type="button"><div class="cell-label">数据恢复</div><div class="cell-body">一次性完整恢复<span class="cell-note" id="complete-phone-restoration-note">校验聊天、头像、记忆、朋友圈和安排表</span></div><div class="mini">›</div></button>
           <button class="cell" onclick="enableCloudTimer()" type="button"><div class="cell-label">推送</div><div class="cell-body">绑定本机云闹钟</div><div class="mini">›</div></button>
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body"><div class="hint" id="cloud-timer-status" style="padding:0;white-space:pre-line">云闹钟未检查。</div></div></div>
           <button class="cell" id="native-notification-status-row" onclick="checkNativeNotificationStatus({ toastResult: true })" type="button" style="display:none"><div class="cell-label">通知</div><div class="cell-body" id="native-notification-status">检查消息提醒</div><div class="mini">›</div></button>
@@ -12754,6 +12755,7 @@ function loadSettings() {
   renderCloudTimerStatus();
   loadYuqiBridgeSettings().then(() => refreshYuqiBridgeStatus()).catch(err => console.warn('[Yuqi Bridge] status skipped:', err.message));
   checkNativeNotificationStatus().catch(err => console.warn('[AL Notification] status skipped:', err.message));
+  refreshCompletePhoneRestorationStatus().catch(err => console.warn('[AL Recovery] status skipped:', err.message));
 }
 function getModelSlot(slot = 'chat') {
   return slot === 'memory'
@@ -14382,6 +14384,53 @@ async function prepareAppStateRecovery() {
   return recoveryDecision;
 }
 
+async function refreshCompletePhoneRestorationStatus() {
+  const note = document.getElementById('complete-phone-restoration-note');
+  const row = document.getElementById('complete-phone-restoration-row');
+  if (row) row.style.display = isNativeApp() ? '' : 'none';
+  if (!note || !isNativeApp()) return;
+  const report = await AppRecoveryJournal.get('complete_restoration_report_v1');
+  if (report?.state === 'committed') {
+    const chats = Number(report.categoryCounts?.chats) || 0;
+    const memories = Number(report.categoryCounts?.memories) || 0;
+    note.textContent = '上次完整恢复成功：' + chats + ' 条消息，' + memories + ' 条记忆';
+  } else {
+    note.textContent = '校验聊天、头像、记忆、朋友圈和安排表';
+  }
+}
+
+async function openCompletePhoneRestoration() {
+  if (!isNativeApp()) {
+    toast('完整手机恢复仅在 Android 端可用');
+    return false;
+  }
+  try {
+    const native = AppStateRecovery.sanitizeNativeCensus(await inspectNativeAppRecoveryState());
+    const yuqi = native.roles?.find(role => role.characterId === 'yuqi');
+    if (native.conflict === true || !yuqi?.candidateAvailable) {
+      throw new Error('手机原生虞栖恢复证据不完整，已保持原数据不变');
+    }
+    let mirror = null;
+    try { mirror = await readExistingAppStateMirrorForRecovery(); } catch { mirror = null; }
+    const recoveryDecision = {
+      mode: 'manual_complete',
+      frozen: true,
+      source: 'native',
+      reasonCode: 'USER_REQUESTED_COMPLETE_RESTORATION',
+      local: appStateRecoveryLocalEvidence(),
+      mirror,
+      native
+    };
+    currentAppStateRecoveryDecision = recoveryDecision;
+    appStateRecoveryGuard.applyDecision(recoveryDecision);
+    renderAppStateRecoveryScreen(recoveryDecision);
+    return true;
+  } catch (error) {
+    toast(error?.message || '完整恢复入口暂不可用');
+    return false;
+  }
+}
+
 function formatRecoveryBytes(value) {
   const bytes = Math.max(0, Number(value) || 0);
   if (bytes < 1024) return `${bytes} B`;
@@ -14390,8 +14439,45 @@ function formatRecoveryBytes(value) {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
+function sanitizeCompleteRestorationReport(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const safeCounts = {};
+  for (const key of ['roles', 'chats', 'moments', 'memories', 'rolePlans']) {
+    const value = Number(raw.categoryCounts?.[key]);
+    safeCounts[key] = Number.isSafeInteger(value) && value >= 0 ? value : 0;
+  }
+  const safeChecksums = {};
+  for (const [key, value] of Object.entries(raw.categoryChecksums || {})) {
+    if (/^[0-9a-f]{64}$/.test(String(value || ''))) safeChecksums[key] = String(value);
+  }
+  const categories = {};
+  for (const [key, row] of Object.entries(raw.report?.categories || {})) {
+    if (!row || typeof row !== 'object') continue;
+    const count = Number(row.count);
+    categories[key] = {
+      status: String(row.status || ''),
+      ...(Number.isSafeInteger(count) && count >= 0 ? { count } : {}),
+      ...(typeof row.reasonCode === 'string' && row.reasonCode ? { reasonCode: row.reasonCode } : {})
+    };
+  }
+  return {
+    version: Number(raw.version) || 1,
+    state: String(raw.state || ''),
+    deletionCharacterId: String(raw.deletionCharacterId || ''),
+    deletionState: String(raw.deletionState || ''),
+    categoryCounts: safeCounts,
+    categoryChecksums: safeChecksums,
+    categories
+  };
+}
+
 async function copyAppStateRecoveryDiagnostics(recoveryDecision) {
-  const diagnostic = AppStateRecovery.buildRecoveryScreenModel(recoveryDecision);
+  const diagnostic = {
+    recovery: AppStateRecovery.buildRecoveryScreenModel(recoveryDecision),
+    complete: sanitizeCompleteRestorationReport(
+      await AppRecoveryJournal.get('complete_restoration_report_v1')
+    )
+  };
   const text = JSON.stringify(diagnostic, null, 2);
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(text);
@@ -14427,24 +14513,39 @@ function renderAppStateRecoveryScreen(recoveryDecision) {
     app.appendChild(blocker);
   }
   const model = AppStateRecovery.buildRecoveryScreenModel(recoveryDecision);
-  const roles = model.roles.map(role => `<li style="margin:8px 0">${esc(role.displayName)} · ${Number(role.rawMessageCount) || 0} 条原生消息</li>`).join('');
-  const canRecover = model.source && model.mode !== 'diagnostic_only' && model.roleCount > 0;
-  blocker.innerHTML = `<h1 style="font-size:22px;margin:0 0 18px">手机数据保护模式</h1>
-    <p style="line-height:1.8;margin:0 0 14px">检测到网页角色入口缺失，所有后台写入已暂停。手机原生数据没有被此页面修改。</p>
+  const completeMode = model.source === 'native';
+  const recoverableRoles = model.roles.filter(role => role.characterId !== CompleteAppRestoration.CONFIRMED_DELETION_ID);
+  const roles = recoverableRoles.map(role => `<li style="margin:8px 0">${esc(role.displayName)} · ${Number(role.rawMessageCount) || 0} 条原生消息</li>`).join('');
+  const categoryRows = [
+    ['角色资料', '合并经校验的角色资料，保留当前有效设置'],
+    ['聊天记录', '按消息身份去重，当前有效记录优先'],
+    ['富结构消息', '恢复多气泡、动作和原生可验证投影'],
+    ['朋友圈', '仅恢复有原生或网页证据的动态'],
+    ['记忆库', '恢复语义记忆；不伪造缺失向量'],
+    ['安排表', '恢复经校验的角色计划与安排'],
+    ['用户资料与设置', '保留当前配置，只补齐缺失字段'],
+    ['头像原图', '仅在找到经校验的原图时恢复，绝不猜造']
+  ].map(([label, detail]) => `<div style="padding:9px 0;border-bottom:1px solid #eee"><strong>${label}</strong><div style="font-size:13px;color:#666;margin-top:3px">${detail}</div></div>`).join('');
+  const canRecover = model.source && model.mode !== 'diagnostic_only'
+    && (completeMode ? recoverableRoles.some(role => role.characterId === 'yuqi') : model.roleCount > 0);
+  blocker.innerHTML = `<h1 style="font-size:22px;margin:0 0 18px">${completeMode ? '手机数据完整恢复' : '手机数据保护模式'}</h1>
+    <p style="line-height:1.8;margin:0 0 14px">恢复操作期间，聊天、主动消息和其他语义写入会暂时冻结；校验完成后自动恢复运行。手机原生数据不会被未经验证的网页值覆盖。</p>
     <div style="background:#fff;border-radius:14px;padding:16px;line-height:1.75">
       <div>恢复来源：${esc(model.sourceName)}</div>
       <div>角色证据：${model.roleCount} 个</div>
       <div>数据库：${formatRecoveryBytes(model.databaseBytes)}</div>
       <div>WAL：${formatRecoveryBytes(model.walBytes)} · SHM：${formatRecoveryBytes(model.shmBytes)}</div>
       <div>原因：${esc(model.reasonCode)}</div>
-      ${roles ? `<ul style="padding-left:20px;margin:12px 0 0">${roles}</ul>` : ''}
+      ${roles ? `<ul style="padding-left:20px;margin:12px 0">${roles}</ul>` : ''}
+      ${completeMode ? `<div style="margin-top:12px;padding:10px;border-radius:10px;background:#fff4e8;color:#744a1e">许弥：永久删除（先备份并建立删除凭证）</div>` : ''}
     </div>
+    ${completeMode ? `<div style="background:#fff;border-radius:14px;padding:8px 16px;margin-top:12px">${categoryRows}</div>` : ''}
     <div id="app-state-recovery-error" style="color:#555;line-height:1.6;margin-top:12px"></div>
-    <button id="app-state-recovery-commit" ${canRecover ? '' : 'disabled'} style="width:100%;margin-top:18px;padding:13px;border:0;border-radius:12px;background:#315f52;color:#fff;font-size:16px">恢复角色入口</button>
-    <button id="app-state-recovery-copy" style="width:100%;margin-top:10px;padding:12px;border:1px solid #bbb;border-radius:12px;background:#fff;font-size:15px">复制诊断</button>
-    <p style="line-height:1.8;margin:18px 0 0;color:#666">恢复完成前请勿执行其他数据操作。</p>`;
+    <button id="app-state-recovery-commit" ${canRecover ? '' : 'disabled'} style="width:100%;margin-top:18px;padding:13px;border:0;border-radius:12px;background:#315f52;color:#fff;font-size:16px">${completeMode ? '一次性完整恢复' : '恢复角色入口'}</button>
+    <button id="app-state-recovery-copy" style="width:100%;margin-top:10px;padding:12px;border:1px solid #bbb;border-radius:12px;background:#fff;font-size:15px">复制诊断（已脱敏）</button>
+    <p style="line-height:1.8;margin:18px 0 0;color:#666">恢复会先校验、再备份、再原子写入；任一步失败都会回滚已写入的恢复数据，已建立的许弥删除凭证不会被撤销。</p>`;
   blocker.querySelector('#app-state-recovery-copy')?.addEventListener('click', () => {
-    copyAppStateRecoveryDiagnostics(recoveryDecision).then(() => toast('诊断已复制'))
+    copyAppStateRecoveryDiagnostics(recoveryDecision).then(() => toast('脱敏诊断已复制'))
       .catch(error => { blocker.querySelector('#app-state-recovery-error').textContent = error?.message || '复制失败'; });
   });
   blocker.querySelector('#app-state-recovery-commit')?.addEventListener('click', event => {
@@ -14453,7 +14554,9 @@ function renderAppStateRecoveryScreen(recoveryDecision) {
     AppStateRecovery.runRecoveryUiAction({
       button,
       statusNode,
-      pendingText: '正在读取并校验手机原生角色与消息，请勿退出应用…',
+      pendingText: completeMode
+        ? '正在校验、备份并完整恢复八类手机数据，请勿退出应用…'
+        : '正在读取并校验恢复证据，请勿退出应用…',
       operation: () => commitAppStateRecovery(model.source)
     });
   });

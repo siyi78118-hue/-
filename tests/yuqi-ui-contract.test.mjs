@@ -1940,6 +1940,39 @@ test('complete recovery commits Web mirror memories and role plans behind the ex
   assert.match(recovery, /applyWebCandidate/);
 });
 
+test('settings always exposes one-button complete phone restoration after an earlier partial recovery', () => {
+  assert.match(html, /id="complete-phone-restoration-row"/);
+  assert.match(html, />一次性完整恢复</);
+  assert.match(html, /openCompletePhoneRestoration/);
+  const screen = html.slice(
+    html.indexOf('function renderAppStateRecoveryScreen'),
+    html.indexOf('function renderAppStateRecoveryBlocker')
+  );
+  for (const label of ['角色资料', '聊天记录', '富结构消息', '朋友圈', '记忆库', '安排表', '用户资料与设置', '头像原图']) {
+    assert.match(screen, new RegExp(label));
+  }
+  assert.match(screen, /许弥/);
+  assert.match(screen, /永久删除/);
+});
+
+test('manual complete restoration freezes writers before reading native evidence and reports metadata only', () => {
+  const operation = html.slice(
+    html.indexOf('async function openCompletePhoneRestoration'),
+    html.indexOf('function formatRecoveryBytes')
+  );
+  assert.match(operation, /inspectNativeAppRecoveryState/);
+  assert.match(operation, /sanitizeNativeCensus/);
+  assert.match(operation, /appStateRecoveryGuard\.applyDecision/);
+  assert.match(operation, /renderAppStateRecoveryScreen/);
+  assert.doesNotMatch(operation, /systemPrompt|chatApiKey|memoryApiKey|avatarData/);
+  const report = html.slice(
+    html.indexOf('async function copyAppStateRecoveryDiagnostics'),
+    html.indexOf('async function commitAppStateRecovery')
+  );
+  assert.match(report, /complete_restoration_report_v1/);
+  assert.doesNotMatch(report, /allChats|content|systemPrompt|avatarData|embedding|vector/);
+});
+
 test('MemoryDB upgrade never deletes an existing meta store during recovery', () => {
   const open = html.slice(html.indexOf('async open()'), html.indexOf('readFallback()'));
   assert.doesNotMatch(open, /deleteObjectStore\('meta'\)/);
