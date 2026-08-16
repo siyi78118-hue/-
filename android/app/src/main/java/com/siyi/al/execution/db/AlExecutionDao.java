@@ -405,6 +405,30 @@ public interface AlExecutionDao {
     @Query("SELECT COUNT(*) FROM role_plans WHERE characterId = :characterId")
     long appRecoveryRolePlanCount(String characterId);
 
+    @Query("SELECT parts.* FROM reply_parts parts INNER JOIN chat_turns turns "
+        + "ON turns.turnId = parts.turnId WHERE turns.characterId = :characterId "
+        + "ORDER BY parts.createdAt ASC, parts.replyPartId ASC")
+    List<ReplyPartEntity> appRecoveryReplyParts(String characterId);
+
+    @Query("SELECT * FROM memory_records WHERE characterId = :characterId "
+        + "ORDER BY updatedAt ASC, memoryId ASC")
+    List<MemoryRecordEntity> appRecoveryMemoryRecords(String characterId);
+
+    @Query("SELECT * FROM role_plans WHERE characterId = :characterId "
+        + "ORDER BY updatedAt ASC, planId ASC")
+    List<RolePlanEntity> appRecoveryRolePlans(String characterId);
+
+    @Query("SELECT history.* FROM role_plan_history history INNER JOIN role_plans plans "
+        + "ON plans.planId = history.planId WHERE plans.characterId = :characterId "
+        + "ORDER BY history.createdAt ASC, history.historyId ASC")
+    List<RolePlanHistoryEntity> appRecoveryRolePlanHistory(String characterId);
+
+    @Query("SELECT parts.* FROM reply_parts parts INNER JOIN chat_turns turns "
+        + "ON turns.turnId = parts.turnId WHERE turns.characterId = :characterId "
+        + "AND parts.type IN ('MOMENT_CREATE','MOMENT_ACTION') "
+        + "ORDER BY parts.createdAt ASC, parts.replyPartId ASC")
+    List<ReplyPartEntity> appRecoveryMomentEvidence(String characterId);
+
     @Query("SELECT * FROM yuqi_raw_messages WHERE characterId = :characterId AND "
         + "(sentAt > :afterSentAt OR (sentAt = :afterSentAt AND messageId > :afterMessageId)) "
         + "ORDER BY sentAt ASC, messageId ASC LIMIT :limit")

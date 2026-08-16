@@ -15,8 +15,11 @@ import com.siyi.al.execution.db.DiagnosticEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.LifecycleControlEntity;
 import com.siyi.al.execution.db.LifecycleInboundAckTombstoneEntity;
+import com.siyi.al.execution.db.MemoryRecordEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.db.RawMessageEntity;
+import com.siyi.al.execution.db.RolePlanEntity;
+import com.siyi.al.execution.db.RolePlanHistoryEntity;
 import com.siyi.al.execution.db.RolePlanOccurrenceEntity;
 import com.siyi.al.execution.db.RoleNotificationCancellationEntity;
 import com.siyi.al.execution.bridge.BridgeInput;
@@ -2557,6 +2560,238 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             }
         });
         return result.get();
+    }
+
+    /** Returns checksum-closed reply parts for an explicit, user-initiated recovery. */
+    public JSONObject readAppRecoveryReplyParts(
+        String characterId, long afterCreatedAt, String afterId, int limit
+    ) {
+        String safeCharacterId = requireCharacterId(characterId);
+        return readRecoveryProjectionPage(
+            "android-app-recovery-reply-part-v1", safeCharacterId,
+            afterCreatedAt, afterId, limit,
+            () -> projectRecoveryReplyParts(dao.appRecoveryReplyParts(safeCharacterId)));
+    }
+
+    /** Returns checksum-closed memory rows for an explicit, user-initiated recovery. */
+    public JSONObject readAppRecoveryMemoryRecords(
+        String characterId, long afterCreatedAt, String afterId, int limit
+    ) {
+        String safeCharacterId = requireCharacterId(characterId);
+        return readRecoveryProjectionPage(
+            "android-app-recovery-memory-v1", safeCharacterId,
+            afterCreatedAt, afterId, limit,
+            () -> projectRecoveryMemories(dao.appRecoveryMemoryRecords(safeCharacterId)));
+    }
+
+    /** Returns checksum-closed role plans and their history for explicit recovery. */
+    public JSONObject readAppRecoveryRolePlans(
+        String characterId, long afterCreatedAt, String afterId, int limit
+    ) {
+        String safeCharacterId = requireCharacterId(characterId);
+        return readRecoveryProjectionPage(
+            "android-app-recovery-role-plan-v1", safeCharacterId,
+            afterCreatedAt, afterId, limit,
+            () -> projectRecoveryRolePlans(
+                dao.appRecoveryRolePlans(safeCharacterId),
+                dao.appRecoveryRolePlanHistory(safeCharacterId)));
+    }
+
+    /** Returns only explicit, persisted moment actions; chat prose is never inferred. */
+    public JSONObject readAppRecoveryMomentEvidence(
+        String characterId, long afterCreatedAt, String afterId, int limit
+    ) {
+        String safeCharacterId = requireCharacterId(characterId);
+        return readRecoveryProjectionPage(
+            "android-app-recovery-moment-evidence-v1", safeCharacterId,
+            afterCreatedAt, afterId, limit,
+            () -> projectRecoveryReplyParts(dao.appRecoveryMomentEvidence(safeCharacterId)));
+    }
+
+    private interface RecoveryProjectionSource {
+        List<RecoveryProjectionRow> read() throws Exception;
+    }
+
+    private static final class RecoveryProjectionRow {
+        final long createdAt;
+        final String id;
+        final JSONObject value;
+
+        RecoveryProjectionRow(long createdAt, String id, JSONObject value) {
+            this.createdAt = createdAt;
+            this.id = id;
+            this.value = value;
+        }
+    }
+
+    private JSONObject readRecoveryProjectionPage(
+        String contract, String characterId, long afterCreatedAt, String afterId,
+        int limit, RecoveryProjectionSource source
+    ) {
+        if (afterCreatedAt < 0L || afterCreatedAt > LifecycleControlSender.MAX_SAFE_INTEGER) {
+            throw new IllegalArgumentException("Android app recovery cursor is invalid");
+        }
+        String safeAfterId = afterId == null ? "" : afterId;
+        if (safeAfterId.length() > 256) {
+            throw new IllegalArgumentException("Android app recovery cursor is invalid");
+        }
+        int safeLimit = Math.max(1, Math.min(limit, 200));
+        AtomicReference<JSONObject> result = new AtomicReference<>();
+        database.runInTransaction(() -> {
+            if (!dao.roleDeleteControlsForCharacter(characterId).isEmpty()) {
+                throw new IllegalStateException("Android app recovery role is deleted");
+            }
+            try {
+                List<RecoveryProjectionRow> all = source.read();
+                JSONArray full = new JSONArray();
+                for (RecoveryProjectionRow row : all) full.put(row.value);
+                String snapshotToken = "sha256:" + BridgeAuthority.sha256CanonicalJson(full);
+                JSONArray visible = new JSONArray();
+                long nextCreatedAt = afterCreatedAt;
+                String nextId = safeAfterId;
+                int remaining = 0;
+                for (RecoveryProjectionRow row : all) {
+                    boolean after = row.createdAt > afterCreatedAt
+                        || (row.createdAt == afterCreatedAt && row.id.compareTo(safeAfterId) > 0);
+                    if (!after) continue;
+                    if (visible.length() < safeLimit) {
+                        visible.put(row.value);
+                        nextCreatedAt = row.createdAt;
+                        nextId = row.id;
+                    } else {
+                        remaining += 1;
+                    }
+                }
+                JSONObject basis = new JSONObject()
+                    .put("contract", contract)
+                    .put("characterId", characterId)
+                    .put("snapshotToken", snapshotToken)
+                    .put("nextCursor", new JSONObject()
+                        .put("afterCreatedAt", nextCreatedAt)
+                        .put("afterId", nextId))
+                    .put("hasMore", remaining > 0)
+                    .put("rows", visible);
+                result.set(new JSONObject(basis.toString())
+                    .put("pageChecksum", BridgeAuthority.sha256CanonicalJson(basis)));
+            } catch (RuntimeException error) {
+                throw error;
+            } catch (Exception error) {
+                throw new IllegalStateException("Android app recovery projection conflict", error);
+            }
+        });
+        return result.get();
+    }
+
+    private List<RecoveryProjectionRow> projectRecoveryReplyParts(List<ReplyPartEntity> rows)
+        throws Exception {
+        List<RecoveryProjectionRow> projected = new java.util.ArrayList<>();
+        for (ReplyPartEntity row : rows) {
+            if (row.replyPartId == null || row.replyPartId.isEmpty()
+                || row.turnId == null || row.turnId.isEmpty()
+                || row.attemptId == null || row.attemptId.isEmpty()
+                || row.sequence < 0 || row.createdAt < 0L
+                || row.createdAt > LifecycleControlSender.MAX_SAFE_INTEGER) {
+                throw new IllegalStateException("Android app recovery reply part conflict");
+            }
+            JSONObject payload = new JSONObject(row.payloadJson);
+            JSONObject basis = new JSONObject()
+                .put("replyPartId", row.replyPartId)
+                .put("turnId", row.turnId)
+                .put("attemptId", row.attemptId)
+                .put("sequence", row.sequence)
+                .put("type", row.type)
+                .put("content", row.content)
+                .put("payload", payload)
+                .put("createdAt", row.createdAt);
+            JSONObject value = new JSONObject(basis.toString())
+                .put("sourceChecksum", BridgeAuthority.sha256CanonicalJson(basis));
+            projected.add(new RecoveryProjectionRow(row.createdAt, row.replyPartId, value));
+        }
+        return projected;
+    }
+
+    private List<RecoveryProjectionRow> projectRecoveryMemories(List<MemoryRecordEntity> rows)
+        throws Exception {
+        List<RecoveryProjectionRow> projected = new java.util.ArrayList<>();
+        Set<String> kinds = new HashSet<>(Arrays.asList("EVENT", "SUMMARY", "PROFILE"));
+        for (MemoryRecordEntity row : rows) {
+            if (row.memoryId == null || row.memoryId.isEmpty()
+                || row.sourceKey == null || row.sourceKey.isEmpty()
+                || !kinds.contains(row.type)
+                || row.createdAt < 0L || row.updatedAt < 0L
+                || row.updatedAt > LifecycleControlSender.MAX_SAFE_INTEGER) {
+                throw new IllegalStateException("Android app recovery memory conflict");
+            }
+            JSONArray vector = new JSONArray(row.vectorJson);
+            for (int index = 0; index < vector.length(); index += 1) {
+                Object value = vector.get(index);
+                if (!(value instanceof Number)
+                    || Double.isNaN(((Number) value).doubleValue())
+                    || Double.isInfinite(((Number) value).doubleValue())) {
+                    throw new IllegalStateException("Android app recovery memory vector conflict");
+                }
+            }
+            JSONObject basis = new JSONObject()
+                .put("memoryId", row.memoryId)
+                .put("sourceKey", row.sourceKey)
+                .put("characterId", row.characterId)
+                .put("type", row.type)
+                .put("title", row.title)
+                .put("content", row.content)
+                .put("vectorJson", row.vectorJson)
+                .put("eventTime", row.eventTime)
+                .put("createdAt", row.createdAt)
+                .put("updatedAt", row.updatedAt)
+                .put("manual", row.manual);
+            JSONObject value = new JSONObject(basis.toString())
+                .put("sourceChecksum", BridgeAuthority.sha256CanonicalJson(basis));
+            projected.add(new RecoveryProjectionRow(row.updatedAt, row.memoryId, value));
+        }
+        return projected;
+    }
+
+    private List<RecoveryProjectionRow> projectRecoveryRolePlans(
+        List<RolePlanEntity> plans, List<RolePlanHistoryEntity> histories
+    ) throws Exception {
+        Map<String, JSONArray> historyByPlan = new HashMap<>();
+        for (RolePlanHistoryEntity history : histories) {
+            JSONObject semantic = new JSONObject(history.historyJson);
+            if (semantic.has("historyId")
+                && !history.historyId.equals(semantic.getString("historyId"))) {
+                throw new IllegalStateException("Android app recovery role plan history conflict");
+            }
+            JSONObject basis = new JSONObject()
+                .put("historyId", history.historyId)
+                .put("planId", history.planId)
+                .put("historyJson", semantic)
+                .put("createdAt", history.createdAt);
+            historyByPlan.computeIfAbsent(history.planId, ignored -> new JSONArray())
+                .put(new JSONObject(basis.toString())
+                    .put("sourceChecksum", BridgeAuthority.sha256CanonicalJson(basis)));
+        }
+        List<RecoveryProjectionRow> projected = new java.util.ArrayList<>();
+        for (RolePlanEntity row : plans) {
+            JSONObject semantic = new JSONObject(row.planJson);
+            if (semantic.has("planId") && !row.planId.equals(semantic.getString("planId"))) {
+                throw new IllegalStateException("Android app recovery role plan conflict");
+            }
+            if (semantic.has("characterId")
+                && !row.characterId.equals(semantic.getString("characterId"))) {
+                throw new IllegalStateException("Android app recovery role plan conflict");
+            }
+            JSONObject basis = new JSONObject()
+                .put("planId", row.planId)
+                .put("characterId", row.characterId)
+                .put("status", row.status)
+                .put("planJson", semantic)
+                .put("nextRunAt", row.nextRunAt == null ? JSONObject.NULL : row.nextRunAt)
+                .put("updatedAt", row.updatedAt)
+                .put("history", historyByPlan.getOrDefault(row.planId, new JSONArray()));
+            JSONObject value = new JSONObject(basis.toString())
+                .put("sourceChecksum", BridgeAuthority.sha256CanonicalJson(basis));
+            projected.add(new RecoveryProjectionRow(row.updatedAt, row.planId, value));
+        }
+        return projected;
     }
 
     public JSONObject androidRoomBackupHead(String characterId, long capturedAt) {

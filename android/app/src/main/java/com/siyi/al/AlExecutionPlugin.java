@@ -698,6 +698,70 @@ public final class AlExecutionPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void readAppRecoveryReplyParts(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            Long afterCreatedAt = call.getLong("afterCreatedAt", 0L);
+            String afterId = optional(call, "afterId", "");
+            Integer limit = call.getInt("limit", 100);
+            return new JSObject(store.readAppRecoveryReplyParts(
+                characterId,
+                afterCreatedAt == null ? 0L : afterCreatedAt,
+                afterId,
+                limit == null ? 100 : limit
+            ).toString());
+        });
+    }
+
+    @PluginMethod
+    public void readAppRecoveryMemoryRecords(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            Long afterCreatedAt = call.getLong("afterCreatedAt", 0L);
+            String afterId = optional(call, "afterId", "");
+            Integer limit = call.getInt("limit", 100);
+            return new JSObject(store.readAppRecoveryMemoryRecords(
+                characterId,
+                afterCreatedAt == null ? 0L : afterCreatedAt,
+                afterId,
+                limit == null ? 100 : limit
+            ).toString());
+        });
+    }
+
+    @PluginMethod
+    public void readAppRecoveryRolePlans(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            Long afterCreatedAt = call.getLong("afterCreatedAt", 0L);
+            String afterId = optional(call, "afterId", "");
+            Integer limit = call.getInt("limit", 100);
+            return new JSObject(store.readAppRecoveryRolePlans(
+                characterId,
+                afterCreatedAt == null ? 0L : afterCreatedAt,
+                afterId,
+                limit == null ? 100 : limit
+            ).toString());
+        });
+    }
+
+    @PluginMethod
+    public void readAppRecoveryMomentEvidence(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            Long afterCreatedAt = call.getLong("afterCreatedAt", 0L);
+            String afterId = optional(call, "afterId", "");
+            Integer limit = call.getInt("limit", 100);
+            return new JSObject(store.readAppRecoveryMomentEvidence(
+                characterId,
+                afterCreatedAt == null ? 0L : afterCreatedAt,
+                afterId,
+                limit == null ? 100 : limit
+            ).toString());
+        });
+    }
+
+    @PluginMethod
     public void requestVerifiedYuqiBackup(PluginCall call) {
         execute(call, () -> {
             String characterId = required(call, "characterId");
