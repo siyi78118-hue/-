@@ -1924,6 +1924,22 @@ test('complete recovery drains each closed native category before building the W
   assert.match(recovery, /mapNativeRolePlanRows/);
 });
 
+test('complete recovery commits Web mirror memories and role plans behind the exact verified Xumi deletion', () => {
+  const recovery = html.slice(
+    html.indexOf('const APP_RECOVERY_JOURNAL_DB'),
+    html.indexOf('async function syncFromServiceWorkerState')
+  );
+  assert.match(recovery, /runCompleteRestorationTransaction/);
+  assert.match(recovery, /CONFIRMED_DELETION_ID/);
+  assert.match(recovery, /nativeFirstRoleDelete/);
+  assert.match(recovery, /readRecoveryMemorySnapshot/);
+  assert.match(recovery, /replaceRecoveryMemorySnapshot/);
+  assert.match(recovery, /readRecoveryRolePlanSnapshot/);
+  assert.match(recovery, /replaceRecoveryRolePlanSnapshot/);
+  assert.match(recovery, /buildPlan/);
+  assert.match(recovery, /applyWebCandidate/);
+});
+
 test('MemoryDB upgrade never deletes an existing meta store during recovery', () => {
   const open = html.slice(html.indexOf('async open()'), html.indexOf('readFallback()'));
   assert.doesNotMatch(open, /deleteObjectStore\('meta'\)/);

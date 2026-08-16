@@ -344,3 +344,171 @@ test('native evidence mappers preserve lossless rows and report unsupported acti
   assert.equal(plans.plans[0].planId, 'plan-1');
   assert.equal(plans.history[0].historyId, 'history-1');
 });
+
+function completeTransactionHarness() {
+  const before = {
+    web: { characters: [{ id: 'yuqi', name: '旧虞栖' }], allChats: {}, allMoments: [] },
+    mirror: { version: 'before' },
+    memories: [{ storeName: 'events', item: { id: 'old-memory', charId: 'yuqi' }, vector: [] }],
+    rolePlans: { plans: [{ planId: 'old-plan', characterId: 'yuqi' }], history: [] }
+  };
+  const state = structuredClone(before);
+  const journalRows = new Map();
+  const events = [];
+  const stores = Object.fromEntries(Object.keys(state).map(name => [name, {
+    async read() { events.push(`read:${name}`); return structuredClone(state[name]); },
+    async write(value) { events.push(`write:${name}`); state[name] = structuredClone(value); },
+    async restore(value) { events.push(`restore:${name}`); state[name] = structuredClone(value); }
+  }]));
+  return {
+    before, state, stores, events, journalRows,
+    journal: {
+      async get(key) { return structuredClone(journalRows.get(key) ?? null); },
+      async put(key, value) { journalRows.set(key, structuredClone(value)); }
+    }
+  };
+}
+
+function completeTransactionTarget() {
+  return {
+    web: {
+      characters: [{ id: 'yuqi', name: '虞栖' }],
+      allChats: { yuqi: { messages: [{ id: 'm1', content: '找回的消息' }] } },
+      allMoments: [{ id: 'moment-1' }]
+    },
+    mirror: { version: 'restored' },
+    memories: [{ storeName: 'events', item: { id: 'memory-1', charId: 'yuqi' }, vector: [0.5] }],
+    rolePlans: { plans: [{ planId: 'plan-1', characterId: 'yuqi' }], history: [] }
+  };
+}
+
+test('complete restoration persists the exact confirmed deletion before atomically verifying every store', async () => {
+  const { runCompleteRestorationTransaction } = restorationModule();
+  const harness = completeTransactionHarness();
+  const target = completeTransactionTarget();
+  const deletionCalls = [];
+  let unlocked = '';
+  const result = await runCompleteRestorationTransaction({
+    journal: harness.journal,
+    stores: harness.stores,
+    target,
+    ensureDeletion: async characterId => {
+      deletionCalls.push(characterId);
+      harness.events.push('deletion');
+      return { state: 'waiting', controlId: 'delete-xumi' };
+    },
+    unlock: checksum => { unlocked = checksum; harness.events.push('unlock'); },
+    now: 100
+  });
+
+  assert.deepEqual(deletionCalls, [DELETED_XUMI_ID]);
+  assert.deepEqual(harness.state, target);
+  assert.match(unlocked, /^[0-9a-f]{64}$/);
+  assert.equal(result.state, 'committed');
+  assert.equal(result.deletionState, 'waiting');
+  assert.ok(harness.events.indexOf('deletion') < harness.events.indexOf('write:web'));
+  const journal = harness.journalRows.get('complete_restoration_v1');
+  assert.deepEqual(Object.keys(journal).sort(), [
+    'beforeChecksums', 'candidateChecksum', 'categoryChecksums', 'categoryCounts',
+    'committedAt', 'deletionCharacterId', 'deletionState', 'preparedAt', 'state', 'version'
+  ].sort());
+  assert.equal(JSON.stringify(journal).includes('找回的消息'), false);
+  assert.equal(JSON.stringify(journal).includes('old-memory'), false);
+});
+
+test('faults after deletion or any store write roll every recoverable store back but retain deletion authority', async () => {
+  const { runCompleteRestorationTransaction } = restorationModule();
+  for (let boundary = 1; boundary <= 8; boundary += 1) {
+    const harness = completeTransactionHarness();
+    let deletionCount = 0;
+    await assert.rejects(() => runCompleteRestorationTransaction({
+      journal: harness.journal,
+      stores: harness.stores,
+      target: completeTransactionTarget(),
+      ensureDeletion: async characterId => {
+        assert.equal(characterId, DELETED_XUMI_ID);
+        deletionCount += 1;
+        return { state: 'pending', controlId: 'delete-xumi' };
+      },
+      unlock: () => {},
+      now: 100,
+      faultAfter: boundary
+    }), new RegExp(`APP_RESTORATION_FAULT_${boundary}`));
+    assert.deepEqual(harness.state, harness.before, `boundary ${boundary}`);
+    assert.equal(harness.journalRows.get('complete_restoration_v1').state, 'rolled_back');
+    if (boundary >= 2) assert.equal(deletionCount, 1);
+  }
+});
+
+test('a failed verified-backup deletion intent performs zero restoration writes', async () => {
+  const { runCompleteRestorationTransaction } = restorationModule();
+  const harness = completeTransactionHarness();
+  await assert.rejects(() => runCompleteRestorationTransaction({
+    journal: harness.journal,
+    stores: harness.stores,
+    target: completeTransactionTarget(),
+    ensureDeletion: async () => { throw new Error('BACKUP_UNAVAILABLE'); },
+    unlock: () => {}
+  }), /BACKUP_UNAVAILABLE/);
+  assert.deepEqual(harness.state, harness.before);
+  assert.equal(harness.events.some(event => event.startsWith('write:')), false);
+});
+
+test('complete restoration is idempotent and never reintroduces the confirmed deleted role', async () => {
+  const { buildPlan, applyWebCandidate, runCompleteRestorationTransaction } = restorationModule();
+  const current = state({ id: DELETED_XUMI_ID, name: '许弥' }, {
+    allChats: { [DELETED_XUMI_ID]: { messages: [{ id: 'x1', content: '旧数据' }] } }
+  });
+  const plan = await buildPlan({
+    current,
+    recoveryBefore: current,
+    legacy: current,
+    mirror: current,
+    builtinYuqi: builtinYuqi(),
+    native: { roles: [{ characterId: 'yuqi', rawMessageCount: 1759 }] },
+    deletionTargets: [DELETED_XUMI_ID]
+  });
+  const web = applyWebCandidate(current, plan);
+  assert.equal(web.characters.some(row => row.id === DELETED_XUMI_ID), false);
+  assert.equal(Object.hasOwn(web.allChats, DELETED_XUMI_ID), false);
+
+  const harness = completeTransactionHarness();
+  const target = { ...completeTransactionTarget(), web };
+  const options = {
+    journal: harness.journal, stores: harness.stores, target,
+    ensureDeletion: async () => ({ state: 'applied', controlId: 'delete-xumi' }),
+    unlock: () => {}, now: 100
+  };
+  await runCompleteRestorationTransaction(options);
+  const once = structuredClone(harness.state);
+  await runCompleteRestorationTransaction(options);
+  assert.deepEqual(harness.state, once);
+});
+
+test('startup rolls an interrupted complete restoration back from checksum-closed before images', async () => {
+  const { rollbackPreparedCompleteRestoration } = restorationModule();
+  const { sha256CanonicalJson } = require('../tavern-app/lib/app-state-recovery.js');
+  const harness = completeTransactionHarness();
+  const beforeChecksums = {};
+  for (const [name, value] of Object.entries(harness.before)) {
+    beforeChecksums[name] = await sha256CanonicalJson(value);
+    harness.journalRows.set('complete_restoration_before_' + name + '_v1', structuredClone(value));
+    harness.state[name] = { interrupted: name };
+  }
+  harness.journalRows.set('complete_restoration_v1', {
+    version: 1, state: 'prepared', deletionCharacterId: DELETED_XUMI_ID,
+    deletionState: 'pending', beforeChecksums,
+    candidateChecksum: 'a'.repeat(64),
+    categoryChecksums: {
+      roles: 'b'.repeat(64), chats: 'c'.repeat(64), moments: 'd'.repeat(64),
+      memories: 'e'.repeat(64), rolePlans: 'f'.repeat(64)
+    },
+    categoryCounts: { roles: 1, chats: 1, moments: 0, memories: 1, rolePlans: 1 },
+    preparedAt: 100, committedAt: null
+  });
+  assert.equal(await rollbackPreparedCompleteRestoration({
+    journal: harness.journal, stores: harness.stores
+  }), true);
+  assert.deepEqual(harness.state, harness.before);
+  assert.equal(harness.journalRows.get('complete_restoration_v1').state, 'rolled_back');
+});

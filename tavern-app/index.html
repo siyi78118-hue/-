@@ -1871,6 +1871,75 @@ const MemoryDB = {
       };
     });
   },
+  async readRecoveryMemorySnapshot() {
+    const result = {};
+    for (const storeName of ['summaries', 'events', 'profiles', 'vectors']) {
+      result[storeName] = structuredClone(await this.all(storeName));
+    }
+    return result;
+  },
+  async replaceRecoveryMemorySnapshot(snapshot) {
+    const names = ['summaries', 'events', 'profiles', 'vectors'];
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)
+      || Object.keys(snapshot).sort().join(',') !== [...names].sort().join(',')
+      || names.some(name => !Array.isArray(snapshot[name]))) {
+      throw new Error('APP_RESTORATION_MEMORY_SNAPSHOT_CONFLICT');
+    }
+    const next = structuredClone(snapshot);
+    const db = await this.open();
+    if (!db) {
+      const data = this.readFallback();
+      for (const name of names) data[name] = next[name];
+      this.writeFallback(data);
+      return true;
+    }
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(names, 'readwrite');
+      for (const name of names) {
+        const store = transaction.objectStore(name);
+        store.clear();
+        for (const row of next[name]) store.put(row);
+      }
+      transaction.oncomplete = () => resolve(true);
+      transaction.onerror = () => reject(transaction.error || new Error('APP_RESTORATION_MEMORY_WRITE_FAILED'));
+      transaction.onabort = () => reject(transaction.error || new Error('APP_RESTORATION_MEMORY_WRITE_ABORTED'));
+    });
+  },
+  async readRecoveryRolePlanSnapshot() {
+    return {
+      plans: structuredClone(await this.getMeta('role_plans_v1', [])),
+      history: structuredClone(await this.getMeta('role_plan_history_v1', []))
+    };
+  },
+  async replaceRecoveryRolePlanSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)
+      || Object.keys(snapshot).sort().join(',') !== 'history,plans'
+      || !Array.isArray(snapshot.plans) || !Array.isArray(snapshot.history)) {
+      throw new Error('APP_RESTORATION_ROLE_PLAN_SNAPSHOT_CONFLICT');
+    }
+    const next = structuredClone(snapshot);
+    const db = await this.open();
+    const updatedAt = Date.now();
+    if (!db) {
+      const data = this.readFallback();
+      const meta = Array.isArray(data.meta) ? data.meta.filter(row =>
+        row?.key !== 'role_plans_v1' && row?.key !== 'role_plan_history_v1') : [];
+      meta.push({ key: 'role_plans_v1', value: next.plans, updatedAt });
+      meta.push({ key: 'role_plan_history_v1', value: next.history, updatedAt });
+      data.meta = meta;
+      this.writeFallback(data);
+      return true;
+    }
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction('meta', 'readwrite');
+      const store = transaction.objectStore('meta');
+      store.put({ key: 'role_plans_v1', value: next.plans, updatedAt });
+      store.put({ key: 'role_plan_history_v1', value: next.history, updatedAt });
+      transaction.oncomplete = () => resolve(true);
+      transaction.onerror = () => reject(transaction.error || new Error('APP_RESTORATION_ROLE_PLAN_WRITE_FAILED'));
+      transaction.onabort = () => reject(transaction.error || new Error('APP_RESTORATION_ROLE_PLAN_WRITE_ABORTED'));
+    });
+  },
   async byChar(storeName, charId) {
     return (await this.all(storeName)).filter(r => r.charId === charId);
   },
@@ -13906,8 +13975,9 @@ async function readNativeAppStateRecoveryCandidate(recoveryDecision) {
     || !plugin?.readAppRecoveryRolePlans || !plugin?.readAppRecoveryMomentEvidence) {
     throw new Error('APP_STATE_RECOVERY_NATIVE_READER_UNAVAILABLE');
   }
-  const roles = (recoveryDecision.native?.roles || []).filter(role => role?.candidateAvailable === true);
-  if (!roles.length || roles.length !== Number(recoveryDecision.native?.roleCount || 0)) {
+  const roles = (recoveryDecision.native?.roles || []).filter(role =>
+    role?.candidateAvailable === true && String(role.characterId || '') === 'yuqi');
+  if (roles.length !== 1) {
     throw new Error('APP_STATE_RECOVERY_NATIVE_CANDIDATE_INCOMPLETE');
   }
   const recoveredCharacters = [];
@@ -14018,6 +14088,191 @@ async function readNativeAppStateRecoveryCandidate(recoveryDecision) {
   };
 }
 
+function cloneCompleteRecoveryValue(value) {
+  return structuredClone(value);
+}
+
+function readCompleteRecoveryWebState() {
+  return cloneCompleteRecoveryValue({
+    settings, characters, allChats, allMoments,
+    updatedAt: Number(localStorage.getItem('rpchat_app_state_updated_at')) || 0
+  });
+}
+
+async function writeCompleteRecoveryWebState(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !value.settings || !Array.isArray(value.characters)
+    || !value.allChats || !Array.isArray(value.allMoments)
+    || !Number.isSafeInteger(value.updatedAt) || value.updatedAt < 0) {
+    throw new Error('APP_RESTORATION_WEB_STATE_CONFLICT');
+  }
+  const next = cloneCompleteRecoveryValue(value);
+  settings = next.settings;
+  characters = next.characters;
+  allChats = next.allChats;
+  allMoments = next.allMoments;
+  localStorage.setItem('rpchat_settings', JSON.stringify(settings));
+  localStorage.setItem('rpchat_characters', JSON.stringify(characters));
+  localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
+  localStorage.setItem('rpchat_moments', JSON.stringify(allMoments));
+  localStorage.setItem('rpchat_app_state_updated_at', String(next.updatedAt));
+  return true;
+}
+
+function mergeCompleteMemorySnapshot(current, recovered, excludedRoleIds) {
+  const names = ['summaries', 'events', 'profiles', 'vectors'];
+  const excluded = new Set(excludedRoleIds || []);
+  const result = Object.fromEntries(names.map(name => [name,
+    (Array.isArray(current?.[name]) ? cloneCompleteRecoveryValue(current[name]) : [])
+      .filter(row => !excluded.has(String(row?.charId || '')))]));
+  const byId = Object.fromEntries(names.map(name => [name,
+    new Map(result[name].map(row => [String(row?.id || ''), row]))]));
+  for (const record of (Array.isArray(recovered) ? recovered : [])) {
+    const storeName = String(record?.storeName || '');
+    const item = record?.item;
+    if (!['summaries', 'events', 'profiles'].includes(storeName)
+      || !item?.id || item.charId !== 'yuqi' || record.verified !== true) continue;
+    if (!byId[storeName].has(String(item.id))) {
+      const saved = cloneCompleteRecoveryValue(item);
+      result[storeName].push(saved);
+      byId[storeName].set(String(saved.id), saved);
+    }
+    if (Array.isArray(record.vector) && record.vector.length === VECTOR_DIM
+      && record.vector.every(value => Number.isFinite(value))) {
+      const sourceType = storeName === 'events' ? 'event'
+        : storeName === 'profiles' ? 'profile' : 'summary';
+      const vectorId = 'vec_' + sourceType + '_' + item.id;
+      if (!byId.vectors.has(vectorId)) {
+        const vector = {
+          id: vectorId,
+          charId: 'yuqi',
+          sourceType,
+          sourceId: item.id,
+          text: item.content || item.detail || '',
+          keywords: Array.isArray(item.keywords) ? cloneCompleteRecoveryValue(item.keywords) : [],
+          importance: Number(item.importance) || 3,
+          embedding: cloneCompleteRecoveryValue(record.vector),
+          createdAt: Number(item.updatedAt || item.createdAt || Date.now())
+        };
+        result.vectors.push(vector);
+        byId.vectors.set(vectorId, vector);
+      }
+    }
+  }
+  return result;
+}
+
+function mergeCompleteRolePlanSnapshot(current, recovered, excludedRoleIds) {
+  const excluded = new Set(excludedRoleIds || []);
+  const existingPlans = (Array.isArray(current?.plans) ? current.plans : [])
+    .filter(plan => !excluded.has(String(plan?.characterId || '')));
+  const nativePlans = (Array.isArray(recovered?.plans) ? recovered.plans : [])
+    .filter(plan => plan?.verified === true && plan.characterId === 'yuqi');
+  const plans = new Map();
+  for (const row of [...nativePlans, ...existingPlans]) {
+    if (row?.planId) plans.set(String(row.planId), cloneCompleteRecoveryValue(row));
+  }
+  const validPlanIds = new Set(plans.keys());
+  const history = new Map();
+  for (const row of [
+    ...(Array.isArray(recovered?.history) ? recovered.history : []),
+    ...(Array.isArray(current?.history) ? current.history : [])
+  ]) {
+    if (row?.historyId && validPlanIds.has(String(row.planId || ''))) {
+      history.set(String(row.historyId), cloneCompleteRecoveryValue(row));
+    }
+  }
+  return { plans: [...plans.values()], history: [...history.values()] };
+}
+
+async function ensureConfirmedRecoveryRoleDeletion(characterId) {
+  if (characterId !== CompleteAppRestoration.CONFIRMED_DELETION_ID) {
+    throw new Error('APP_RESTORATION_DELETION_TARGET_CONFLICT');
+  }
+  const plugin = nativeExecutionPlugin();
+  const existing = await roleDeleteControlStatus(characterId, plugin);
+  if (['waiting', 'pending', 'relay_accepted', 'applied'].includes(existing.state)) return existing;
+  if (existing.state !== 'none') throw new Error('APP_RESTORATION_DELETION_AUTHORITY_CONFLICT');
+  return nativeFirstRoleDelete(characterId, { plugin });
+}
+
+function completeRestorationStoreAdapters() {
+  return {
+    web: {
+      read: readCompleteRecoveryWebState,
+      write: writeCompleteRecoveryWebState,
+      restore: writeCompleteRecoveryWebState
+    },
+    mirror: {
+      read: readExistingAppStateMirrorForRecovery,
+      write: writeExistingAppStateMirrorForRecovery,
+      restore: restoreExistingAppStateMirrorForRecovery
+    },
+    memories: {
+      read: () => MemoryDB.readRecoveryMemorySnapshot(),
+      write: value => MemoryDB.replaceRecoveryMemorySnapshot(value),
+      restore: value => MemoryDB.replaceRecoveryMemorySnapshot(value)
+    },
+    rolePlans: {
+      read: () => MemoryDB.readRecoveryRolePlanSnapshot(),
+      write: value => MemoryDB.replaceRecoveryRolePlanSnapshot(value),
+      restore: value => MemoryDB.replaceRecoveryRolePlanSnapshot(value)
+    }
+  };
+}
+
+async function executeCompleteNativeRestoration(recoveryDecision, candidate) {
+  const collected = await collectCompleteRestorationSources();
+  const nativeEvidence = candidate.nativeEvidence;
+  if (!nativeEvidence) throw new Error('APP_RESTORATION_NATIVE_EVIDENCE_INCOMPLETE');
+  const native = {
+    roles: recoveryDecision.native?.roles || [],
+    settings: candidate.settings || {},
+    messages: candidate.allChats?.yuqi?.messages || [],
+    reply: nativeEvidence.reply,
+    memories: nativeEvidence.memories,
+    rolePlans: nativeEvidence.rolePlans,
+    moments: nativeEvidence.moments
+  };
+  const plan = await CompleteAppRestoration.buildPlan({
+    current: collected.current,
+    recoveryBefore: collected.recoveryBefore,
+    legacy: collected.legacy,
+    preRecoveryMirror: collected.preRecoveryMirror,
+    mirror: collected.mirror,
+    native,
+    builtinYuqi: collected.builtinYuqi,
+    deletionTargets: [CompleteAppRestoration.CONFIRMED_DELETION_ID]
+  });
+  const webTarget = CompleteAppRestoration.applyWebCandidate(collected.current, plan);
+  webTarget.updatedAt = Date.now();
+  const currentMemories = await MemoryDB.readRecoveryMemorySnapshot();
+  const currentRolePlans = await MemoryDB.readRecoveryRolePlanSnapshot();
+  const target = {
+    web: cloneCompleteRecoveryValue(webTarget),
+    mirror: cloneCompleteRecoveryValue(webTarget),
+    memories: mergeCompleteMemorySnapshot(currentMemories, plan.memories, plan.excludedRoleIds),
+    rolePlans: mergeCompleteRolePlanSnapshot(currentRolePlans, plan.rolePlans, plan.excludedRoleIds)
+  };
+  const result = await CompleteAppRestoration.runCompleteRestorationTransaction({
+    journal: AppRecoveryJournal,
+    stores: completeRestorationStoreAdapters(),
+    target,
+    ensureDeletion: ensureConfirmedRecoveryRoleDeletion,
+    unlock: checksum => appStateRecoveryGuard.unlockAfterVerifiedRecovery(checksum)
+  });
+  await AppRecoveryJournal.put('complete_restoration_report_v1', {
+    version: 1,
+    state: result.state,
+    deletionCharacterId: CompleteAppRestoration.CONFIRMED_DELETION_ID,
+    deletionState: result.deletionState,
+    categoryCounts: result.categoryCounts,
+    categoryChecksums: result.categoryChecksums,
+    report: plan.report
+  });
+  return result;
+}
+
 async function executeAppStateRecoveryCommit(recoveryDecision) {
   let candidate;
   if (recoveryDecision.source === 'native') {
@@ -14031,6 +14286,11 @@ async function executeAppStateRecoveryCommit(recoveryDecision) {
   }
   if (!candidate || !Array.isArray(candidate.characters) || candidate.characters.length === 0) {
     throw new Error('APP_STATE_RECOVERY_CANDIDATE_EMPTY');
+  }
+  if (recoveryDecision.source === 'native') {
+    const complete = await executeCompleteNativeRestoration(recoveryDecision, candidate);
+    location.reload();
+    return complete;
   }
   const targetState = AppStateRecovery.mergeRecoveryState(
     appStateRecoveryLocalEvidence(),
@@ -14055,6 +14315,23 @@ async function executeAppStateRecoveryCommit(recoveryDecision) {
 async function prepareAppStateRecovery() {
   if (isNativeApp()) {
     try {
+      const completeRolledBack = await CompleteAppRestoration.rollbackPreparedCompleteRestoration({
+        journal: AppRecoveryJournal,
+        stores: completeRestorationStoreAdapters()
+      });
+      if (completeRolledBack) {
+        const completeRollbackDecision = {
+          mode: 'rollback_complete',
+          frozen: true,
+          source: '',
+          reasonCode: 'INTERRUPTED_COMPLETE_RESTORATION_ROLLED_BACK',
+          local: {}, mirror: null, native: { roleCount: 0 }
+        };
+        currentAppStateRecoveryDecision = completeRollbackDecision;
+        appStateRecoveryGuard.applyDecision(completeRollbackDecision);
+        location.reload();
+        return completeRollbackDecision;
+      }
       const rolledBack = await AppStateRecovery.rollbackPreparedRecovery({
         storage: localStorage,
         journal: AppRecoveryJournal,

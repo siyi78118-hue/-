@@ -457,7 +457,7 @@
             detail: row.content,
             ...(row.type === 'EVENT' ? { happenedAt: row.eventTime } : {})
           };
-      return { storeName: stores[row.type], item, vector };
+      return { storeName: stores[row.type], item, vector, verified: true };
     }));
   }
 
@@ -476,7 +476,8 @@
         status: row.status,
         nextRunAt: row.nextRunAt,
         updatedAt: row.updatedAt,
-        nativeRecoveryChecksum: row.sourceChecksum
+        nativeRecoveryChecksum: row.sourceChecksum,
+        verified: true
       });
       for (const record of row.history) {
         if ((record.historyJson.historyId && record.historyJson.historyId !== record.historyId)
@@ -512,6 +513,209 @@
       else nativeOnly.push(clone(row));
     }
     return deepFreeze({ creates, actions, nativeOnly });
+  }
+
+  const COMPLETE_STORE_ORDER = Object.freeze(['web', 'mirror', 'memories', 'rolePlans']);
+  const DELETION_FROZEN_STATES = Object.freeze(new Set([
+    'waiting', 'pending', 'relay_accepted', 'applied'
+  ]));
+
+  function countTargetCategories(target) {
+    const chats = target.web?.allChats && typeof target.web.allChats === 'object'
+      ? Object.values(target.web.allChats).reduce((count, chat) =>
+          count + (Array.isArray(chat?.messages) ? chat.messages.length : 0), 0)
+      : 0;
+    return {
+      roles: Array.isArray(target.web?.characters) ? target.web.characters.length : 0,
+      chats,
+      moments: Array.isArray(target.web?.allMoments) ? target.web.allMoments.length : 0,
+      memories: Array.isArray(target.memories) ? target.memories.length : 0,
+      rolePlans: (Array.isArray(target.rolePlans?.plans) ? target.rolePlans.plans.length : 0)
+        + (Array.isArray(target.rolePlans?.history) ? target.rolePlans.history.length : 0)
+    };
+  }
+
+  async function targetCategoryChecksums(target) {
+    return {
+      roles: await sha256CanonicalJson(target.web?.characters || []),
+      chats: await sha256CanonicalJson(target.web?.allChats || {}),
+      moments: await sha256CanonicalJson(target.web?.allMoments || []),
+      memories: await sha256CanonicalJson(target.memories || []),
+      rolePlans: await sha256CanonicalJson(target.rolePlans || { plans: [], history: [] })
+    };
+  }
+
+  function assertCompleteTransactionAdapters(journal, stores, target, ensureDeletion, unlock) {
+    if (!journal?.put || !target || typeof target !== 'object' || Array.isArray(target)
+      || Object.keys(target).sort().join(',') !== [...COMPLETE_STORE_ORDER].sort().join(',')
+      || typeof ensureDeletion !== 'function' || typeof unlock !== 'function') {
+      throw new Error('APP_RESTORATION_TRANSACTION_ADAPTER_CONFLICT');
+    }
+    for (const name of COMPLETE_STORE_ORDER) {
+      const store = stores?.[name];
+      if (!store || typeof store.read !== 'function' || typeof store.write !== 'function'
+        || typeof store.restore !== 'function') {
+        throw new Error('APP_RESTORATION_TRANSACTION_ADAPTER_CONFLICT');
+      }
+    }
+  }
+
+  async function runCompleteRestorationTransaction({
+    journal, stores, target, ensureDeletion, unlock, now = Date.now(), faultAfter = 0
+  } = {}) {
+    assertCompleteTransactionAdapters(journal, stores, target, ensureDeletion, unlock);
+    requireSafeInteger(now, 'APP_RESTORATION_TIME_CONFLICT');
+    const frozenTarget = clone(target);
+    const candidateChecksum = await sha256CanonicalJson(frozenTarget);
+    const categoryChecksums = await targetCategoryChecksums(frozenTarget);
+    const categoryCounts = countTargetCategories(frozenTarget);
+    const before = {};
+    const beforeChecksums = {};
+    for (const name of COMPLETE_STORE_ORDER) {
+      before[name] = clone(await stores[name].read());
+      beforeChecksums[name] = await sha256CanonicalJson(before[name]);
+      await journal.put('complete_restoration_before_' + name + '_v1', before[name]);
+    }
+    let record = {
+      version: 1,
+      state: 'prepared',
+      deletionCharacterId: CONFIRMED_DELETION_ID,
+      deletionState: 'not_started',
+      beforeChecksums,
+      candidateChecksum,
+      categoryChecksums,
+      categoryCounts,
+      preparedAt: now,
+      committedAt: null
+    };
+    const written = [];
+    let unlocked = false;
+    const fault = boundary => {
+      if (Number(faultAfter) === boundary) {
+        throw new Error('APP_RESTORATION_FAULT_' + boundary);
+      }
+    };
+    try {
+      await journal.put('complete_restoration_v1', record);
+      fault(1);
+
+      const deletion = await ensureDeletion(CONFIRMED_DELETION_ID);
+      const deletionState = String(deletion?.state || '');
+      if (!DELETION_FROZEN_STATES.has(deletionState)) {
+        throw new Error('APP_RESTORATION_DELETION_AUTHORITY_CONFLICT');
+      }
+      record = { ...record, deletionState };
+      await journal.put('complete_restoration_v1', record);
+      fault(2);
+
+      for (let index = 0; index < COMPLETE_STORE_ORDER.length; index += 1) {
+        const name = COMPLETE_STORE_ORDER[index];
+        await stores[name].write(clone(frozenTarget[name]));
+        written.push(name);
+        fault(index + 3);
+      }
+
+      for (const name of COMPLETE_STORE_ORDER) {
+        const actual = await stores[name].read();
+        if (await sha256CanonicalJson(actual) !== await sha256CanonicalJson(frozenTarget[name])) {
+          throw new Error('APP_RESTORATION_VERIFY_CONFLICT:' + name);
+        }
+      }
+      fault(7);
+
+      record = { ...record, state: 'committed', committedAt: now };
+      await journal.put('complete_restoration_v1', record);
+      fault(8);
+
+      unlock(candidateChecksum);
+      unlocked = true;
+      return clone(record);
+    } catch (error) {
+      if (!unlocked) {
+        let rollbackError = null;
+        for (const name of [...written].reverse()) {
+          try { await stores[name].restore(clone(before[name])); }
+          catch (restoreError) { rollbackError ||= restoreError; }
+        }
+        for (const name of written) {
+          try {
+            const restored = await stores[name].read();
+            if (await sha256CanonicalJson(restored) !== beforeChecksums[name]) {
+              rollbackError ||= new Error('APP_RESTORATION_ROLLBACK_VERIFY_CONFLICT:' + name);
+            }
+          } catch (verifyError) { rollbackError ||= verifyError; }
+        }
+        record = { ...record, state: 'rolled_back', committedAt: null };
+        await journal.put('complete_restoration_v1', record);
+        if (rollbackError) {
+          const failure = new Error('APP_RESTORATION_ROLLBACK_FAILED');
+          failure.cause = rollbackError;
+          throw failure;
+        }
+      }
+      throw error;
+    }
+  }
+
+  async function rollbackPreparedCompleteRestoration({ journal, stores } = {}) {
+    if (!journal?.get || !journal?.put) {
+      throw new Error('APP_RESTORATION_TRANSACTION_ADAPTER_CONFLICT');
+    }
+    for (const name of COMPLETE_STORE_ORDER) {
+      if (!stores?.[name] || typeof stores[name].read !== 'function'
+        || typeof stores[name].restore !== 'function') {
+        throw new Error('APP_RESTORATION_TRANSACTION_ADAPTER_CONFLICT');
+      }
+    }
+    const record = await journal.get('complete_restoration_v1');
+    if (!record || record.state !== 'prepared') return false;
+    assertExactKeys(record, [
+      'version', 'state', 'deletionCharacterId', 'deletionState', 'beforeChecksums',
+      'candidateChecksum', 'categoryChecksums', 'categoryCounts',
+      'preparedAt', 'committedAt'
+    ], 'APP_RESTORATION_JOURNAL_CONFLICT');
+    if (record.version !== 1 || record.deletionCharacterId !== CONFIRMED_DELETION_ID
+      || !['not_started', ...DELETION_FROZEN_STATES].includes(record.deletionState)
+      || record.committedAt !== null || !Number.isSafeInteger(record.preparedAt)
+      || record.preparedAt < 0 || !/^[0-9a-f]{64}$/.test(record.candidateChecksum || '')) {
+      throw new Error('APP_RESTORATION_JOURNAL_CONFLICT');
+    }
+    assertExactKeys(record.beforeChecksums, COMPLETE_STORE_ORDER,
+      'APP_RESTORATION_JOURNAL_CONFLICT');
+    assertExactKeys(record.categoryChecksums,
+      ['roles', 'chats', 'moments', 'memories', 'rolePlans'],
+      'APP_RESTORATION_JOURNAL_CONFLICT');
+    assertExactKeys(record.categoryCounts,
+      ['roles', 'chats', 'moments', 'memories', 'rolePlans'],
+      'APP_RESTORATION_JOURNAL_CONFLICT');
+    const checksumValues = [
+      ...Object.values(record.beforeChecksums),
+      ...Object.values(record.categoryChecksums)
+    ];
+    if (checksumValues.some(value => !/^[0-9a-f]{64}$/.test(value || ''))
+      || Object.values(record.categoryCounts).some(value =>
+        !Number.isSafeInteger(value) || value < 0)) {
+      throw new Error('APP_RESTORATION_JOURNAL_CONFLICT');
+    }
+    const before = {};
+    for (const name of COMPLETE_STORE_ORDER) {
+      before[name] = await journal.get('complete_restoration_before_' + name + '_v1');
+      if (await sha256CanonicalJson(before[name]) !== record.beforeChecksums[name]) {
+        throw new Error('APP_RESTORATION_BEFORE_CHECKSUM_CONFLICT:' + name);
+      }
+    }
+    for (const name of [...COMPLETE_STORE_ORDER].reverse()) {
+      await stores[name].restore(clone(before[name]));
+    }
+    for (const name of COMPLETE_STORE_ORDER) {
+      if (await sha256CanonicalJson(await stores[name].read()) !== record.beforeChecksums[name]) {
+        throw new Error('APP_RESTORATION_ROLLBACK_VERIFY_CONFLICT:' + name);
+      }
+    }
+    await journal.put('complete_restoration_v1', {
+      ...record, state: 'rolled_back', committedAt: null
+    });
+    return true;
   }
 
   function mergeRoleByField(roleId, sources, fallback) {
@@ -559,8 +763,11 @@
   }
 
   function verifiedNativeMoments(native) {
-    return (Array.isArray(native?.momentEvidence) ? native.momentEvidence : [])
-      .filter(row => row && row.verified === true && typeof row.id === 'string' && row.id);
+    const rows = Array.isArray(native?.moments?.creates)
+      ? native.moments.creates
+      : (Array.isArray(native?.momentEvidence) ? native.momentEvidence : []);
+    return rows.filter(row => row && row.verified === true
+      && typeof row.id === 'string' && row.id);
   }
 
   function mergeIdentityRows(sources) {
@@ -590,7 +797,10 @@
     const excludedRoleIds = assertDeletionTargets(deletionTargets);
     const roleSources = [current, recoveryBefore, legacy, preRecoveryMirror, mirror];
     const yuqi = mergeRoleByField('yuqi', roleSources, builtinYuqi);
-    const nativeMessages = (Array.isArray(native.messages) ? native.messages : []).map(row => ({
+    const nativeMessages = [
+      ...(Array.isArray(native.messages) ? native.messages : []),
+      ...(Array.isArray(native.reply?.messages) ? native.reply.messages : [])
+    ].map(row => ({
       ...clone(row),
       id: String(row?.id || row?.messageId || ''),
       role: row?.role || (row?.speakerType === 'user' ? 'user' : 'assistant'),
@@ -616,17 +826,41 @@
       ? { status: roleFrom(current, 'yuqi')?.avatarData === yuqi.avatarData
         ? 'already_present' : 'restored' }
       : { status: 'no_verified_source', reasonCode: 'avatar_bytes_missing' };
+    const settings = Object.assign({},
+      clone(native.settings || {}), clone(mirror.settings || {}),
+      clone(preRecoveryMirror.settings || {}), clone(legacy.settings || {}),
+      clone(recoveryBefore.settings || {}), clone(current.settings || {}));
+    const memories = (Array.isArray(native.memories) ? native.memories : [])
+      .filter(row => row?.verified === true);
+    const rolePlans = {
+      plans: (Array.isArray(native.rolePlans?.plans) ? native.rolePlans.plans : [])
+        .filter(row => row?.verified === true),
+      history: Array.isArray(native.rolePlans?.history) ? clone(native.rolePlans.history) : []
+    };
+    const nativeOnly = [
+      ...(Array.isArray(native.reply?.nativeOnly) ? native.reply.nativeOnly : []),
+      ...(Array.isArray(native.moments?.nativeOnly) ? native.moments.nativeOnly : [])
+    ];
     return deepFreeze({
       version: 1,
       excludedRoleIds,
+      settings,
       roles: { yuqi },
       chats: { yuqi: { messages } },
       moments,
-      memories: (Array.isArray(native.memories) ? native.memories : []).filter(row => row?.verified === true),
-      rolePlans: (Array.isArray(native.rolePlans) ? native.rolePlans : []).filter(row => row?.verified === true),
+      memories,
+      rolePlans,
+      nativeOnly,
       report: {
         unconfirmedEmptyRoleIds,
-        categories: { avatar }
+        categories: {
+          avatar,
+          messages: { status: 'restored', count: messages.length },
+          moments: { status: moments.length ? 'restored' : 'no_verified_source', count: moments.length },
+          memories: { status: memories.length ? 'restored' : 'no_verified_source', count: memories.length },
+          rolePlans: { status: rolePlans.plans.length ? 'restored' : 'no_verified_source', count: rolePlans.plans.length },
+          nativeOnly: { status: nativeOnly.length ? 'native_only' : 'already_present', count: nativeOnly.length }
+        }
       }
     });
   }
@@ -650,6 +884,7 @@
     };
     return {
       ...clone(current),
+      settings: { ...(clone(plan.settings || {})), ...(clone(current.settings || {})) },
       characters: [...characters.values()],
       allChats,
       allMoments: mergeIdentityRows([plan.moments, current.allMoments])
@@ -667,6 +902,8 @@
     mapNativeMemoryRows,
     mapNativeRolePlanRows,
     mapNativeMomentRows,
+    runCompleteRestorationTransaction,
+    rollbackPreparedCompleteRestoration,
     validAvatarData,
     CONFIRMED_DELETION_ID
   });
