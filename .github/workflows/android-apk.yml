@@ -96,7 +96,7 @@ jobs:
         run: |
           set +e
           set -o pipefail
-          ./gradlew testDebugUnitTest assembleDebugAndroidTest --no-daemon 2>&1 | tee native-check.log
+          ./gradlew testDebugUnitTest assembleDebug assembleDebugAndroidTest --no-daemon 2>&1 | tee native-check.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
             details="$(tail -n 35 native-check.log | sed -e 's/%/%25/g' -e ':a;N;$!ba;s/\r/%0D/g;s/\n/%0A/g')"
