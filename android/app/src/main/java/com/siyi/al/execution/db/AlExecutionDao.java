@@ -242,6 +242,10 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM lifecycle_controls WHERE characterId = :characterId AND clearEpoch = :clearEpoch LIMIT 1")
     LifecycleControlEntity lifecycleControlForClear(String characterId, long clearEpoch);
 
+    @Query("SELECT COALESCE(MAX(clearEpoch), 0) FROM lifecycle_controls "
+        + "WHERE characterId = :characterId AND controlKind = 'conversation_clear_v1'")
+    long maxConversationClearEpoch(String characterId);
+
     @Query("SELECT * FROM lifecycle_controls ORDER BY controlId ASC")
     List<LifecycleControlEntity> lifecycleControls();
 

@@ -123,6 +123,12 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
             // foreign-key/index contract. Rebuild the table in the migration
             // itself so reopen validation does not depend on the old DDL or a
             // test fixture.
+            database.execSQL("CREATE TABLE IF NOT EXISTS `execution_attempts` ("
+                + "`attemptId` TEXT NOT NULL, `turnId` TEXT NOT NULL, `sequence` INTEGER NOT NULL, "
+                + "`stage` TEXT NOT NULL, `state` TEXT NOT NULL, `startedAt` INTEGER NOT NULL, "
+                + "`heartbeatAt` INTEGER NOT NULL, `finishedAt` INTEGER, `memoryResult` TEXT, `rawReply` TEXT, "
+                + "`errorCode` TEXT, `errorDetail` TEXT, `retryable` INTEGER NOT NULL, `crashCount` INTEGER NOT NULL, "
+                + "PRIMARY KEY(`attemptId`))");
             database.execSQL("CREATE TABLE `execution_attempts_v11` ("
                 + "`attemptId` TEXT NOT NULL, `turnId` TEXT NOT NULL, `sequence` INTEGER NOT NULL, "
                 + "`stage` TEXT NOT NULL, `state` TEXT NOT NULL, `startedAt` INTEGER NOT NULL, "
@@ -140,6 +146,13 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
             database.execSQL("CREATE INDEX `index_execution_attempts_turnId` ON `execution_attempts` (`turnId`)");
             database.execSQL("CREATE UNIQUE INDEX `index_execution_attempts_turnId_sequence` ON `execution_attempts` (`turnId`, `sequence`)");
             database.execSQL("CREATE INDEX `index_execution_attempts_stage_heartbeatAt` ON `execution_attempts` (`stage`, `heartbeatAt`)");
+            database.execSQL("CREATE TABLE IF NOT EXISTS `reply_parts` ("
+                + "`replyPartId` TEXT NOT NULL, `turnId` TEXT NOT NULL, `attemptId` TEXT NOT NULL, "
+                + "`sequence` INTEGER NOT NULL, `type` TEXT NOT NULL, `content` TEXT NOT NULL, "
+                + "`payloadJson` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, PRIMARY KEY(`replyPartId`), "
+                + "FOREIGN KEY(`turnId`) REFERENCES `chat_turns`(`turnId`) ON DELETE CASCADE)");
+            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_reply_parts_turnId_sequence` ON `reply_parts` (`turnId`, `sequence`)");
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_reply_parts_attemptId` ON `reply_parts` (`attemptId`)");
             database.execSQL("CREATE TABLE IF NOT EXISTS `conversation_cursors` ("
                 + "`characterId` TEXT NOT NULL, `nativeCompletedTurnId` TEXT, "
                 + "`nativeCompletedGroupId` TEXT, `nativeCompletedSequence` INTEGER NOT NULL, "

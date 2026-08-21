@@ -3114,7 +3114,9 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             if (newCursor && dao.insertConversationCursor(cursor) == -1L) {
                 throw new IllegalStateException("conversation clear cursor race");
             }
-            long clearEpoch = cursor.clearEpoch + 1L;
+            long clearEpoch = Math.max(
+                cursor.clearEpoch, dao.maxConversationClearEpoch(safeCharacterId)
+            ) + 1L;
             long clearedThroughSequence = cursor.localSequence;
             LifecycleControlCodec.Encoded encoded;
             try {
