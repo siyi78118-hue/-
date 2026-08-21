@@ -836,6 +836,34 @@ public class ConversationCursorStoreTest {
         db.execSQL("CREATE INDEX `index_execution_attempts_turnId` ON `execution_attempts` (`turnId`)");
         db.execSQL("CREATE UNIQUE INDEX `index_execution_attempts_turnId_sequence` ON `execution_attempts` (`turnId`, `sequence`)");
         db.execSQL("CREATE INDEX `index_execution_attempts_stage_heartbeatAt` ON `execution_attempts` (`stage`, `heartbeatAt`)");
+        // These tables predate the v10 authority migration.  A real v10
+        // database already contains them; keeping them in this fixture makes
+        // Room's post-upgrade schema check exercise the migration rather than
+        // treating an intentionally tiny test database as a corrupt install.
+        db.execSQL("CREATE TABLE `memory_records` ("
+            + "`memoryId` TEXT NOT NULL, `sourceKey` TEXT NOT NULL, `characterId` TEXT NOT NULL, "
+            + "`type` TEXT NOT NULL, `title` TEXT NOT NULL, `content` TEXT NOT NULL, `vectorJson` TEXT NOT NULL, "
+            + "`eventTime` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, "
+            + "`manual` INTEGER NOT NULL, PRIMARY KEY(`memoryId`))");
+        db.execSQL("CREATE UNIQUE INDEX `index_memory_records_sourceKey` ON `memory_records` (`sourceKey`)");
+        db.execSQL("CREATE INDEX `index_memory_records_characterId_type_eventTime` ON `memory_records` (`characterId`, `type`, `eventTime`)");
+        db.execSQL("CREATE TABLE `character_snapshots` ("
+            + "`snapshotId` TEXT NOT NULL, `characterId` TEXT NOT NULL, `characterName` TEXT NOT NULL, "
+            + "`playerName` TEXT NOT NULL, `systemPrompt` TEXT NOT NULL, `momentSystemPrompt` TEXT NOT NULL, "
+            + "`contextJson` TEXT NOT NULL, `chatConfigId` TEXT NOT NULL, `memoryConfigId` TEXT NOT NULL, "
+            + "`createdAt` INTEGER NOT NULL, `scheduledFor` INTEGER, `automaticKind` TEXT, `cloudJobId` TEXT, "
+            + "`automaticTasksEnabled` INTEGER NOT NULL, `jobSnapshot` INTEGER NOT NULL, PRIMARY KEY(`snapshotId`))");
+        db.execSQL("CREATE INDEX `index_character_snapshots_characterId_createdAt` ON `character_snapshots` (`characterId`, `createdAt`)");
+        db.execSQL("CREATE INDEX `index_character_snapshots_cloudJobId_scheduledFor` ON `character_snapshots` (`cloudJobId`, `scheduledFor`)");
+        db.execSQL("CREATE TABLE `diagnostics` ("
+            + "`diagnosticId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `turnId` TEXT, `attemptId` TEXT, "
+            + "`level` TEXT NOT NULL, `code` TEXT NOT NULL, `detail` TEXT NOT NULL, `createdAt` INTEGER NOT NULL)");
+        db.execSQL("CREATE INDEX `index_diagnostics_turnId_createdAt` ON `diagnostics` (`turnId`, `createdAt`)");
+        db.execSQL("CREATE INDEX `index_diagnostics_code_createdAt` ON `diagnostics` (`code`, `createdAt`)");
+        db.execSQL("CREATE TABLE `change_events` ("
+            + "`cursor` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `turnId` TEXT, `type` TEXT NOT NULL, "
+            + "`payloadJson` TEXT NOT NULL, `createdAt` INTEGER NOT NULL)");
+        db.execSQL("CREATE INDEX `index_change_events_turnId_cursor` ON `change_events` (`turnId`, `cursor`)");
     }
 
     private static void insertPopulatedV11History(SupportSQLiteDatabase db) {
