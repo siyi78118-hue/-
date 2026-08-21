@@ -38,6 +38,7 @@ import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.db.RawMessageEntity;
 import com.siyi.al.execution.db.RolePlanEntity;
 import com.siyi.al.execution.db.RolePlanHistoryEntity;
+import com.siyi.al.execution.db.RoleDeleteOperationEntity;
 import com.siyi.al.execution.db.SyncCursorEntity;
 import com.siyi.al.execution.db.YuqiAnnotationEntity;
 import com.siyi.al.execution.LifecycleControl;
@@ -246,7 +247,8 @@ public final class AlExecutionPlugin extends Plugin {
             annotation.annotationId = optional(call, "annotationId", "annotation_" + UUID.randomUUID().toString().replace("-", ""));
             annotation.turnId = required(call, "turnId");
             ChatTurnEntity annotatedTurn = store.turn(annotation.turnId);
-            if (annotatedTurn != null) store.assertRoleAcceptsSemanticWrite(annotatedTurn.characterId);
+            if (annotatedTurn == null) throw new IllegalArgumentException("annotation turn not found");
+            store.assertRoleAcceptsSemanticWrite(annotatedTurn.characterId);
             String sourceMessageId = optional(call, "sourceMessageId", "");
             annotation.sourceMessageId = sourceMessageId.isEmpty() ? null : sourceMessageId;
             annotation.presetVersion = optional(call, "presetVersion", "1.0.0");
@@ -257,12 +259,18 @@ public final class AlExecutionPlugin extends Plugin {
             annotation.checksum = annotation.annotationId;
             AlExecutionDatabase database = AlExecutionDatabase.get(getContext());
             final long[] inserted = new long[] { -1L };
-            database.runInTransaction(() -> {
-                ChatTurnEntity currentTurn = store.turn(annotation.turnId);
-                if (currentTurn != null) store.assertRoleAcceptsSemanticWrite(currentTurn.characterId);
-                annotation.syncSeq = database.executionDao().allocateJournalSyncSeq(annotation.createdAt);
-                inserted[0] = database.executionDao().insertYuqiAnnotation(annotation);
+            boolean accepted = store.runRoleSideEffectIfNotDeleted(annotatedTurn.characterId, () -> {
+                database.runInTransaction(() -> {
+                    ChatTurnEntity currentTurn = store.turn(annotation.turnId);
+                    if (currentTurn == null || !annotatedTurn.characterId.equals(currentTurn.characterId)) {
+                        throw new IllegalStateException("annotation turn target conflict");
+                    }
+                    store.assertRoleAcceptsSemanticWrite(currentTurn.characterId);
+                    annotation.syncSeq = database.executionDao().allocateJournalSyncSeq(annotation.createdAt);
+                    inserted[0] = database.executionDao().insertYuqiAnnotation(annotation);
+                });
             });
+            if (!accepted) throw new IllegalStateException("role delete tombstone prevents annotation");
             JSObject result = new JSObject();
             result.put("saved", inserted[0] != -1L);
             result.put("annotationId", annotation.annotationId);
@@ -294,14 +302,17 @@ public final class AlExecutionPlugin extends Plugin {
             Long createdAt = call.getLong("createdAt", System.currentTimeMillis());
             snapshot.createdAt = createdAt == null ? System.currentTimeMillis() : createdAt;
             AlExecutionDatabase database = AlExecutionDatabase.get(getContext());
-            database.runInTransaction(() -> {
-                store.assertRoleAcceptsSemanticWrite(snapshot.characterId);
-                database.executionDao().upsertSnapshot(snapshot);
+            boolean saved = store.runRoleSideEffectIfNotDeleted(snapshot.characterId, () -> {
+                database.runInTransaction(() -> {
+                    store.assertRoleAcceptsSemanticWrite(snapshot.characterId);
+                    database.executionDao().upsertSnapshot(snapshot);
+                });
+                if (snapshot.jobSnapshot && snapshot.scheduledFor != null && snapshot.automaticTasksEnabled) {
+                    AutomaticTaskAlarmScheduler.schedule(getContext(), snapshot.cloudJobId, snapshot.scheduledFor);
+                    AlExecutionWakeWorker.enqueueAutomatic(getContext(), snapshot.cloudJobId, snapshot.scheduledFor);
+                }
             });
-            if (snapshot.jobSnapshot && snapshot.scheduledFor != null && snapshot.automaticTasksEnabled) {
-                AutomaticTaskAlarmScheduler.schedule(getContext(), snapshot.cloudJobId, snapshot.scheduledFor);
-                AlExecutionWakeWorker.enqueueAutomatic(getContext(), snapshot.cloudJobId, snapshot.scheduledFor);
-            }
+            if (!saved) throw new IllegalStateException("role delete tombstone prevents proactive snapshot");
             JSObject result = new JSObject();
             result.put("saved", true);
             result.put("snapshotId", snapshot.snapshotId);
@@ -316,47 +327,50 @@ public final class AlExecutionPlugin extends Plugin {
             JSONArray values = new JSONArray(call.getString("messagesJson", "[]"));
             AlExecutionDatabase database = AlExecutionDatabase.get(getContext());
             final int[] inserted = new int[] { 0 };
-            database.runInTransaction(() -> {
-                store.assertRoleAcceptsSemanticWrite(characterId);
-                for (int index = 0; index < values.length(); index += 1) {
-                    JSONObject value;
-                    try {
-                        value = values.getJSONObject(index);
-                    } catch (JSONException error) {
-                        throw new IllegalArgumentException("messagesJson item is invalid", error);
+            boolean accepted = store.runRoleSideEffectIfNotDeleted(characterId, () -> {
+                database.runInTransaction(() -> {
+                    store.assertRoleAcceptsSemanticWrite(characterId);
+                    for (int index = 0; index < values.length(); index += 1) {
+                        JSONObject value;
+                        try {
+                            value = values.getJSONObject(index);
+                        } catch (JSONException error) {
+                            throw new IllegalArgumentException("messagesJson item is invalid", error);
+                        }
+                        String messageId = requiredJson(value, "messageId");
+                        if (database.executionDao().rawMessage(messageId) != null) continue;
+                        String speakerType = value.optString("speakerType", "").trim();
+                        String speakerId = value.optString("speakerId", "").trim();
+                        if ("user".equals(speakerType) && !"user".equals(speakerId)) {
+                            throw new IllegalArgumentException("user speaker attribution mismatch");
+                        }
+                        if ("character".equals(speakerType) && !characterId.equals(speakerId)) {
+                            throw new IllegalArgumentException("character speaker attribution mismatch");
+                        }
+                        if (!"user".equals(speakerType) && !"character".equals(speakerType)) {
+                            throw new IllegalArgumentException("speakerType is invalid");
+                        }
+                        RawMessageEntity row = new RawMessageEntity();
+                        row.messageId = messageId;
+                        row.turnId = value.optString("turnId", "turn_legacy_" + messageId).trim();
+                        if (row.turnId.isEmpty()) row.turnId = "turn_legacy_" + messageId;
+                        row.characterId = characterId;
+                        row.speakerId = speakerId;
+                        row.speakerType = speakerType;
+                        row.recipientId = "user".equals(speakerType) ? characterId : "user";
+                        row.content = requiredJson(value, "content");
+                        row.sentAt = Math.max(1L, value.optLong("sentAt", System.currentTimeMillis()));
+                        row.origin = value.optString("origin", "user".equals(speakerType) ? "phone" : "legacy_fallback");
+                        row.deviceId = secrets.loadBridgeConfig().deviceId + ":visible";
+                        long syncSeq = database.executionDao().allocateJournalSyncSeq(System.currentTimeMillis());
+                        row.deviceSeq = syncSeq;
+                        row.syncSeq = syncSeq;
+                        row.checksum = messageId;
+                        if (database.executionDao().insertRawMessage(row) != -1L) inserted[0] += 1;
                     }
-                    String messageId = requiredJson(value, "messageId");
-                    if (database.executionDao().rawMessage(messageId) != null) continue;
-                    String speakerType = value.optString("speakerType", "").trim();
-                    String speakerId = value.optString("speakerId", "").trim();
-                    if ("user".equals(speakerType) && !"user".equals(speakerId)) {
-                        throw new IllegalArgumentException("user speaker attribution mismatch");
-                    }
-                    if ("character".equals(speakerType) && !characterId.equals(speakerId)) {
-                        throw new IllegalArgumentException("character speaker attribution mismatch");
-                    }
-                    if (!"user".equals(speakerType) && !"character".equals(speakerType)) {
-                        throw new IllegalArgumentException("speakerType is invalid");
-                    }
-                    RawMessageEntity row = new RawMessageEntity();
-                    row.messageId = messageId;
-                    row.turnId = value.optString("turnId", "turn_legacy_" + messageId).trim();
-                    if (row.turnId.isEmpty()) row.turnId = "turn_legacy_" + messageId;
-                    row.characterId = characterId;
-                    row.speakerId = speakerId;
-                    row.speakerType = speakerType;
-                    row.recipientId = "user".equals(speakerType) ? characterId : "user";
-                    row.content = requiredJson(value, "content");
-                    row.sentAt = Math.max(1L, value.optLong("sentAt", System.currentTimeMillis()));
-                    row.origin = value.optString("origin", "user".equals(speakerType) ? "phone" : "legacy_fallback");
-                    row.deviceId = secrets.loadBridgeConfig().deviceId + ":visible";
-                    long syncSeq = database.executionDao().allocateJournalSyncSeq(System.currentTimeMillis());
-                    row.deviceSeq = syncSeq;
-                    row.syncSeq = syncSeq;
-                    row.checksum = messageId;
-                    if (database.executionDao().insertRawMessage(row) != -1L) inserted[0] += 1;
-                }
+                });
             });
+            if (!accepted) throw new IllegalStateException("role delete tombstone prevents visible message import");
             JSObject result = new JSObject();
             result.put("saved", true);
             result.put("inserted", inserted[0]);
@@ -779,15 +793,27 @@ public final class AlExecutionPlugin extends Plugin {
             String characterId = required(call, "characterId");
             String expectedCursorChecksum = required(call, "expectedCursorChecksum");
             JSONObject backupReceipt = new JSONObject(required(call, "backupReceiptJson"));
-            LifecycleControl control = store.createRoleDelete(
+            String operationId = call.getString("operationId", "");
+            if (operationId.isEmpty()) {
+                RoleDeleteOperationEntity existing =
+                    store.queryRoleDeleteOperationForCharacter(characterId);
+                operationId = existing == null
+                    ? store.roleDeleteOperationIdForRequest(
+                        characterId, expectedCursorChecksum, backupReceipt)
+                    : existing.operationId;
+            }
+            LifecycleControl control = store.createRoleDeleteOperation(
+                operationId,
                 characterId,
                 expectedCursorChecksum,
                 backupReceipt,
+                System.currentTimeMillis(),
                 () -> AlExecutionWakeWorker.prearmLifecycle(getContext()),
                 notificationId -> NotificationManagerCompat.from(getContext()).cancel(notificationId)
             );
             AlExecutionService.requestRun(getContext());
-            return roleDeleteControlResult(characterId, control);
+            return roleDeleteControlResult(
+                characterId, control, store.queryRoleDeleteOperation(operationId));
         });
     }
 
@@ -795,7 +821,30 @@ public final class AlExecutionPlugin extends Plugin {
     public void getRoleDeleteStatus(PluginCall call) {
         execute(call, () -> {
             String characterId = required(call, "characterId");
-            return roleDeleteControlResult(characterId, store.roleDeleteControl(characterId));
+            RoleDeleteOperationEntity operation = store.queryRoleDeleteOperationForCharacter(characterId);
+            if (operation != null && ("prepared".equals(operation.state) || "running".equals(operation.state))) {
+                operation = store.reconcileRoleDeleteOperation(
+                    operation.operationId, System.currentTimeMillis(), 120_000L);
+            }
+            return roleDeleteControlResult(
+                characterId,
+                store.roleDeleteControl(characterId),
+                operation);
+        });
+    }
+
+    @PluginMethod
+    public void reconcileRoleDelete(PluginCall call) {
+        execute(call, () -> {
+            String operationId = required(call, "operationId");
+            long timeoutMs = call.getLong("timeoutMs", 120_000L);
+            RoleDeleteOperationEntity operation = store.reconcileRoleDeleteOperation(
+                operationId, System.currentTimeMillis(), timeoutMs);
+            if (operation == null) throw new IllegalStateException("role delete operation not found");
+            return roleDeleteControlResult(
+                operation.characterId,
+                store.roleDeleteControl(operation.characterId),
+                operation);
         });
     }
 
@@ -952,11 +1001,14 @@ public final class AlExecutionPlugin extends Plugin {
                 history.add(row);
             }
             AlExecutionDatabase database = AlExecutionDatabase.get(getContext());
-            database.runInTransaction(() -> {
-                store.assertRoleAcceptsSemanticWrite(characterId);
-                database.executionDao().replaceRolePlans(characterId, plans, history);
+            boolean saved = store.runRoleSideEffectIfNotDeleted(characterId, () -> {
+                database.runInTransaction(() -> {
+                    store.assertRoleAcceptsSemanticWrite(characterId);
+                    database.executionDao().replaceRolePlans(characterId, plans, history);
+                });
+                RolePlanAlarmScheduler.rescheduleAll(getContext());
             });
-            RolePlanAlarmScheduler.rescheduleAll(getContext());
+            if (!saved) throw new IllegalStateException("role delete tombstone prevents role plan replacement");
             JSObject result = new JSObject();
             result.put("saved", true);
             result.put("count", plans.size());
@@ -1343,6 +1395,12 @@ public final class AlExecutionPlugin extends Plugin {
     }
 
     private static JSObject roleDeleteControlResult(String characterId, LifecycleControl control) {
+        return roleDeleteControlResult(characterId, control, null);
+    }
+
+    private static JSObject roleDeleteControlResult(
+        String characterId, LifecycleControl control, RoleDeleteOperationEntity operation
+    ) {
         JSObject result = new JSObject();
         result.put("characterId", characterId);
         if (control == null) {
@@ -1351,17 +1409,37 @@ public final class AlExecutionPlugin extends Plugin {
             result.put("requestedAt", 0L);
             result.put("appliedAt", JSONObject.NULL);
             result.put("semanticChecksum", "");
-            return result;
+        } else {
+            if (!LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind)
+                || !characterId.equals(control.characterId)) {
+                throw new IllegalStateException("role delete authority conflict");
+            }
+            result.put("controlId", control.controlId);
+            result.put("state", control.state);
+            result.put("requestedAt", control.requestedAt);
+            result.put("appliedAt", control.appliedAt == null ? JSONObject.NULL : control.appliedAt);
+            result.put("semanticChecksum", control.semanticChecksum);
         }
-        if (!LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind)
-            || !characterId.equals(control.characterId)) {
-            throw new IllegalStateException("role delete authority conflict");
+        if (operation == null) {
+            result.put("operationId", "");
+            result.put("operationState", "none");
+            result.put("operationPhase", "");
+            result.put("operationChecksum", "");
+            result.put("affectedCount", 0L);
+            result.put("operationUpdatedAt", 0L);
+            result.put("lastError", JSONObject.NULL);
+        } else {
+            if (!characterId.equals(operation.characterId)) {
+                throw new IllegalStateException("role delete operation target conflict");
+            }
+            result.put("operationId", operation.operationId);
+            result.put("operationState", operation.state);
+            result.put("operationPhase", operation.phase);
+            result.put("operationChecksum", operation.operationChecksum);
+            result.put("affectedCount", operation.affectedCount);
+            result.put("operationUpdatedAt", operation.updatedAt);
+            result.put("lastError", operation.lastError == null ? JSONObject.NULL : operation.lastError);
         }
-        result.put("controlId", control.controlId);
-        result.put("state", control.state);
-        result.put("requestedAt", control.requestedAt);
-        result.put("appliedAt", control.appliedAt == null ? JSONObject.NULL : control.appliedAt);
-        result.put("semanticChecksum", control.semanticChecksum);
         return result;
     }
 

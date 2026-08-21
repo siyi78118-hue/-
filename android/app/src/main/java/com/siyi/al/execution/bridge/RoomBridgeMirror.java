@@ -20,7 +20,16 @@ import org.json.JSONObject;
 public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
     interface RoleDeletionGate {
         boolean tombstoned(String roleId);
+        default boolean runIfNotDeleted(String roleId, Runnable sideEffect) {
+            if (tombstoned(roleId)) return false;
+            sideEffect.run();
+            return !tombstoned(roleId);
+        }
     }
+    interface CheckedRoleWrite {
+        boolean run() throws Exception;
+    }
+
     interface CanonicalApplier {
         RoomExecutionStore.CanonicalCloudTarget resolve(
             String lineageKey, String authoritativeTurnId);
@@ -49,7 +58,14 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         RoomExecutionStore store,
         String deviceId
     ) {
-        this(dao, canonicalApplier(store), deviceId, store::isRoleDeleteTombstoned);
+        this(dao, canonicalApplier(store), deviceId, new RoleDeletionGate() {
+            @Override public boolean tombstoned(String roleId) {
+                return store.isRoleDeleteTombstoned(roleId);
+            }
+            @Override public boolean runIfNotDeleted(String roleId, Runnable sideEffect) {
+                return store.runRoleSideEffectIfNotDeleted(roleId, sideEffect);
+            }
+        });
     }
 
     RoomBridgeMirror(AlExecutionDao dao, CanonicalApplier canonicalApplier, String deviceId) {
@@ -68,7 +84,6 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
 
     @Override public void persistSubmission(TurnSubmission submission) throws Exception {
         if (submission.kind != TurnKind.DIRECT_REPLY) return;
-        if (roleDeletionGate.tombstoned(submission.characterId)) return;
         JSONObject raw = BridgeInput.userMessage(submission);
         String content = raw.optString("content", "");
         if (content.trim().isEmpty()) throw new IllegalArgumentException("raw user message is empty");
@@ -85,12 +100,14 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         entity.deviceId = deviceId;
         entity.deviceSeq = BridgeInput.deviceSeq(submission);
         entity.checksum = sha256(canonical(entity));
-        entity.syncSeq = nextSyncSeq();
-        dao.insertRawMessage(entity);
+        entity.syncSeq = 0L;
+        roleDeletionGate.runIfNotDeleted(submission.characterId, () -> {
+            entity.syncSeq = nextSyncSeq();
+            dao.insertRawMessage(entity);
+        });
     }
 
     @Override public void persistReply(TurnSubmission submission, BridgeResult result) throws Exception {
-        if (roleDeletionGate.tombstoned(submission.characterId)) return;
         JSONObject response = new JSONObject(result.responseJson == null ? "{}" : result.responseJson);
         JSONObject remoteReply = response.optJSONObject("reply");
         RawMessageEntity entity = new RawMessageEntity();
@@ -110,8 +127,11 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         entity.deviceId = result.fallback ? deviceId + ":fallback" : "pc:" + deviceId;
         entity.deviceSeq = Math.max(1L, entity.sentAt);
         entity.checksum = sha256(canonical(entity));
-        entity.syncSeq = result.fallback ? nextSyncSeq() : 0L;
-        dao.insertRawMessage(entity);
+        entity.syncSeq = 0L;
+        roleDeletionGate.runIfNotDeleted(submission.characterId, () -> {
+            entity.syncSeq = result.fallback ? nextSyncSeq() : 0L;
+            dao.insertRawMessage(entity);
+        });
     }
 
     public boolean persistCloudInboxReply(String raw) throws Exception {
@@ -129,24 +149,29 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
             localTurnId = remoteTurnId;
             turn = dao.turn(localTurnId);
         }
+        final String resolvedLocalTurnId = localTurnId;
         if (turn != null && roleDeletionGate.tombstoned(turn.characterId)) return true;
 
         if (reply == null) {
             if (response.optBoolean("terminal", false) && "skip".equals(response.optString("action", ""))) {
-                return turn != null && dao.importCloudBacklogSkip(localTurnId, System.currentTimeMillis());
+                if (turn == null) return false;
+                boolean applied = runCheckedRoleWrite(turn.characterId,
+                    () -> dao.importCloudBacklogSkip(resolvedLocalTurnId, System.currentTimeMillis()));
+                return applied || roleDeletionGate.tombstoned(turn.characterId);
             }
             String remoteState = response.optString("state", "").trim();
             if (turn == null || !response.optBoolean("terminal", false) || !"failed".equals(remoteState)) {
                 return false;
             }
             boolean retryable = response.optBoolean("allowFallback", false);
-            return dao.importCloudBacklogFailure(
-                localTurnId,
+            boolean applied = runCheckedRoleWrite(turn.characterId, () -> dao.importCloudBacklogFailure(
+                resolvedLocalTurnId,
                 retryable ? "FAILED_RETRYABLE" : "FAILED_FINAL",
                 "REMOTE_REPLY_FAILED",
                 "回复暂时没有送达，请重试",
                 System.currentTimeMillis()
-            );
+            ));
+            return applied || roleDeletionGate.tombstoned(turn.characterId);
         }
         String content = reply.optString("content", "").trim();
         String messageId = reply.optString("messageId", "").trim();
@@ -157,7 +182,8 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         if (characterId.isEmpty() && turn != null) characterId = turn.characterId;
         if (characterId.isEmpty()) characterId = response.optString("characterId", "").trim();
         if (characterId.isEmpty()) return false;
-        if (roleDeletionGate.tombstoned(characterId)) return true;
+        final String resolvedCharacterId = characterId;
+        if (roleDeletionGate.tombstoned(resolvedCharacterId)) return true;
 
         RawMessageEntity entity = new RawMessageEntity();
         entity.messageId = messageId;
@@ -173,7 +199,10 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         entity.deviceSeq = Math.max(1L, sentAt);
         entity.checksum = sha256(canonical(entity));
         entity.syncSeq = 0L;
-        dao.insertRawMessage(entity);
+        if (!runCheckedRoleWrite(resolvedCharacterId, () -> {
+            dao.insertRawMessage(entity);
+            return true;
+        })) return true;
 
         if (completedTurnAlreadyContainsReply(turn, content)) return true;
 
@@ -186,36 +215,41 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
                 return false;
             }
             ReplyPartEntity originalPart = backlogPart(messageId, localTurnId, turn.activeAttemptId, content, sentAt);
-            if (dao.importCloudBacklogReply(localTurnId, originalPart, sentAt)) return true;
+            boolean imported = runCheckedRoleWrite(resolvedCharacterId,
+                () -> dao.importCloudBacklogReply(resolvedLocalTurnId, originalPart, sentAt));
+            if (imported || roleDeletionGate.tombstoned(characterId)) return true;
         }
 
         String digest = sha256(messageId).substring(0, 24);
         String backfillTurnId = "cloud_backfill_" + digest;
-        ChatTurnEntity backfillTurn = dao.turn(backfillTurnId);
-        if (backfillTurn == null) {
-            backfillTurn = new ChatTurnEntity();
-            backfillTurn.turnId = backfillTurnId;
-            backfillTurn.characterId = characterId;
-            backfillTurn.sourceMessageId = "source_cloud_backfill_" + digest;
-            backfillTurn.cloudJobId = null;
-            backfillTurn.kind = TurnKind.PROACTIVE_CHAT.name();
-            backfillTurn.state = "COMPLETED";
-            backfillTurn.activeAttemptId = null;
-            backfillTurn.inputJson = new JSONObject()
-                .put("source", "cloud_backfill")
-                .put("remoteTurnId", remoteTurnId)
-                .toString();
-            backfillTurn.snapshotJson = new JSONObject()
-                .put("characterId", characterId)
-                .toString();
-            backfillTurn.createdAt = sentAt;
-            backfillTurn.updatedAt = sentAt;
-            backfillTurn.completedAt = sentAt;
-            backfillTurn.uiAppliedAt = null;
-            dao.insertTurn(backfillTurn);
-        }
-        ReplyPartEntity independentPart = backlogPart(messageId, backfillTurnId, null, content, sentAt);
-        return dao.importCloudBacklogReply(backfillTurnId, independentPart, sentAt);
+        boolean backfillApplied = runCheckedRoleWrite(resolvedCharacterId, () -> {
+            ChatTurnEntity backfillTurn = dao.turn(backfillTurnId);
+            if (backfillTurn == null) {
+                backfillTurn = new ChatTurnEntity();
+                backfillTurn.turnId = backfillTurnId;
+                backfillTurn.characterId = resolvedCharacterId;
+                backfillTurn.sourceMessageId = "source_cloud_backfill_" + digest;
+                backfillTurn.cloudJobId = null;
+                backfillTurn.kind = TurnKind.PROACTIVE_CHAT.name();
+                backfillTurn.state = "COMPLETED";
+                backfillTurn.activeAttemptId = null;
+                backfillTurn.inputJson = new JSONObject()
+                    .put("source", "cloud_backfill")
+                    .put("remoteTurnId", remoteTurnId)
+                    .toString();
+                backfillTurn.snapshotJson = new JSONObject()
+                    .put("characterId", resolvedCharacterId)
+                    .toString();
+                backfillTurn.createdAt = sentAt;
+                backfillTurn.updatedAt = sentAt;
+                backfillTurn.completedAt = sentAt;
+                backfillTurn.uiAppliedAt = null;
+                dao.insertTurn(backfillTurn);
+            }
+            ReplyPartEntity independentPart = backlogPart(messageId, backfillTurnId, null, content, sentAt);
+            return dao.importCloudBacklogReply(backfillTurnId, independentPart, sentAt);
+        });
+        return backfillApplied || roleDeletionGate.tombstoned(characterId);
     }
 
     public void recordCanonicalCloudRejection(
@@ -357,6 +391,20 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         part.payloadJson = "{}";
         part.createdAt = sentAt;
         return part;
+    }
+
+    private boolean runCheckedRoleWrite(String characterId, CheckedRoleWrite action) throws Exception {
+        final boolean[] result = {false};
+        final Exception[] failure = {null};
+        boolean completed = roleDeletionGate.runIfNotDeleted(characterId, () -> {
+            try {
+                result[0] = action.run();
+            } catch (Exception error) {
+                failure[0] = error;
+            }
+        });
+        if (failure[0] != null) throw failure[0];
+        return completed && result[0];
     }
 
     private long nextSyncSeq() {

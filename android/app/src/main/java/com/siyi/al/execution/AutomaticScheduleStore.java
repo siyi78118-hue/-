@@ -79,13 +79,26 @@ public final class AutomaticScheduleStore {
 
     public boolean claim(String streamKey, String authorityEpoch, long generation,
                          String jobId, long now) {
-        int changed = dao.claimAutomaticScheduleAuthorityExact(
-            streamKey, authorityEpoch, generation, jobId, now);
-        if (changed == 1) return true;
-        AutomaticScheduleAuthorityEntity current = dao.automaticScheduleAuthority(streamKey);
-        return current != null && OWNER.equals(current.owner) && "claimed".equals(current.state)
-            && current.generation == generation && authorityEpoch.equals(current.authorityEpoch)
-            && jobId != null && jobId.equals(current.activeJobId);
+        final boolean[] result = {false};
+        database.runInTransaction(() -> {
+            AutomaticScheduleAuthorityEntity before = dao.automaticScheduleAuthority(streamKey);
+            if (before == null || before.characterId == null || before.characterId.isEmpty()
+                || !dao.roleDeleteControlsForCharacter(before.characterId).isEmpty()) {
+                return;
+            }
+            int changed = dao.claimAutomaticScheduleAuthorityExact(
+                streamKey, authorityEpoch, generation, jobId, now);
+            if (changed == 1) {
+                result[0] = true;
+                return;
+            }
+            AutomaticScheduleAuthorityEntity current = dao.automaticScheduleAuthority(streamKey);
+            result[0] = current != null && OWNER.equals(current.owner) && "claimed".equals(current.state)
+                && current.generation == generation && authorityEpoch.equals(current.authorityEpoch)
+                && jobId != null && jobId.equals(current.activeJobId)
+                && dao.roleDeleteControlsForCharacter(current.characterId).isEmpty();
+        });
+        return result[0];
     }
 
     public AutomaticScheduleAuthorityEntity finalizeAutomatic(

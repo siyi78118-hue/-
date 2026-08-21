@@ -22,6 +22,7 @@ import com.siyi.al.execution.db.RolePlanEntity;
 import com.siyi.al.execution.db.RolePlanHistoryEntity;
 import com.siyi.al.execution.db.RolePlanOccurrenceEntity;
 import com.siyi.al.execution.db.RoleNotificationCancellationEntity;
+import com.siyi.al.execution.db.RoleDeleteOperationEntity;
 import com.siyi.al.execution.bridge.BridgeInput;
 import com.siyi.al.execution.bridge.BridgeResult;
 import com.siyi.al.execution.bridge.BridgeTurnStatus;
@@ -183,6 +184,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         validatePersistedLifecycleControls();
         validatePersistedLifecycleInboundAckTombstones();
         validatePersistedRoleNotificationCancellations();
+        validatePersistedRoleDeleteOperations();
     }
 
     private void validatePersistedLifecycleControls() {
@@ -217,6 +219,26 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     private void validatePersistedRoleNotificationCancellations() {
         for (RoleNotificationCancellationEntity row : dao.roleNotificationCancellations()) {
             validatePersistedRoleNotificationCancellation(row);
+        }
+    }
+
+    private void validatePersistedRoleDeleteOperations() {
+        for (RoleDeleteOperationEntity row : dao.roleDeleteOperations()) {
+            validatePersistedRoleDeleteOperation(row);
+            LifecycleControlEntity control = dao.lifecycleControl(row.controlId);
+            if (control == null || !LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind)
+                || !row.characterId.equals(control.characterId)) {
+                throw new IllegalStateException("role delete operation tombstone conflict");
+            }
+            if (!"legacy_control_recovered".equals(row.phase)) {
+                String expectedCursorChecksum = roleDeleteOperationExpectedCursorChecksum(row);
+                String expectedOperationChecksum = roleDeleteOperationChecksum(
+                    row.operationId, row.controlId, row.characterId, control.peerId,
+                    expectedCursorChecksum, row.sourceSnapshotChecksum, control.semanticChecksum);
+                if (!expectedOperationChecksum.equals(row.operationChecksum)) {
+                    throw new IllegalStateException("role delete operation checksum conflict");
+                }
+            }
         }
     }
 
@@ -725,76 +747,80 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
      * Turn proof, schedule transition and outbox/event rows share one Room transaction.
      */
     public AutomaticFinalization finalizeAutomaticScheduleForTurn(String turnId, long now) {
+        ChatTurnEntity initial = dao.turn(turnId);
+        if (initial == null || initial.deletedAt != null) return AutomaticFinalization.stale();
         AtomicReference<AutomaticFinalization> result =
             new AtomicReference<>(AutomaticFinalization.stale());
-        database.runInTransaction(() -> {
-            ChatTurnEntity turn = dao.turn(turnId);
-            if (turn == null || turn.deletedAt != null || isRoleDeleteTombstoned(turn.characterId)) return;
-            boolean direct = TurnKind.DIRECT_REPLY.name().equals(turn.kind);
-            boolean moment = TurnKind.PROACTIVE_MOMENT.name().equals(turn.kind);
-            boolean proactive = moment || TurnKind.PROACTIVE_CHAT.name().equals(turn.kind);
-            if (!direct && !proactive) return;
-            AutomaticScheduleAuthorityEntity current =
-                dao.automaticScheduleAuthorityForCharacterKind(
-                    turn.characterId, moment ? "moment" : "chat");
-            if (current == null || "disabled".equals(current.state)) return;
+        boolean gateCompleted = runRoleSideEffectIfNotDeleted(initial.characterId, () -> {
+            database.runInTransaction(() -> {
+                ChatTurnEntity turn = dao.turn(turnId);
+                if (turn == null || turn.deletedAt != null || isRoleDeleteTombstoned(turn.characterId)) return;
+                boolean direct = TurnKind.DIRECT_REPLY.name().equals(turn.kind);
+                boolean moment = TurnKind.PROACTIVE_MOMENT.name().equals(turn.kind);
+                boolean proactive = moment || TurnKind.PROACTIVE_CHAT.name().equals(turn.kind);
+                if (!direct && !proactive) return;
+                AutomaticScheduleAuthorityEntity current =
+                    dao.automaticScheduleAuthorityForCharacterKind(
+                        turn.characterId, moment ? "moment" : "chat");
+                if (current == null || "disabled".equals(current.state)) return;
 
-            AutomaticScheduleContract.TerminalDisposition disposition =
-                terminalDispositionForAutomaticSchedule(turn);
-            if (disposition == null) return;
-            JSONObject currentSemantic;
-            try {
-                currentSemantic = new JSONObject(current.semanticJson);
-                AutomaticScheduleContract.validateTransition(currentSemantic);
-            } catch (Exception error) {
-                throw new IllegalStateException("automatic schedule authority conflict", error);
-            }
-            String deviceId = currentSemantic.optString("deviceId", "");
-            String epoch = currentSemantic.optString("authorityEpoch", "");
-            String resultChecksum = automaticTerminalChecksum(turn, disposition);
-            String sourceType = disposition == AutomaticScheduleContract.TerminalDisposition.FAILED
-                ? "failure_retry" : (direct ? "direct_terminal" : "proactive_terminal");
-            AutomaticScheduleContract.Source source = new AutomaticScheduleContract.Source(
-                sourceType,
-                automaticTerminalSourceId(turn, direct),
-                resultChecksum,
-                current.conversationSequence,
-                automaticTerminalOccurredAt(turn, now));
-            AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, deviceId);
-            String previousJobId = current.activeJobId;
-            AutomaticScheduleAuthorityEntity next;
-            if (direct) {
-                AutomaticScheduleContract.Source pauseSource = directInputSource(turn);
-                String currentSourceType = currentSemantic.optString("sourceType", "");
-                String currentSourceId = currentSemantic.optString("sourceId", "");
-                String currentSourceChecksum = currentSemantic.optString("sourceChecksum", "");
-                boolean ownsPause = "direct_input".equals(currentSourceType)
-                    && pauseSource.id.equals(currentSourceId)
-                    && pauseSource.checksum.equals(currentSourceChecksum);
-                boolean exactTerminalReplay = sourceType.equals(currentSourceType)
-                    && source.id.equals(currentSourceId)
-                    && source.checksum.equals(currentSourceChecksum);
-                if (sourceType.equals(currentSourceType) && source.id.equals(currentSourceId)
-                    && !source.checksum.equals(currentSourceChecksum)) {
-                    throw new IllegalStateException("automatic schedule source checksum conflict");
+                AutomaticScheduleContract.TerminalDisposition disposition =
+                    terminalDispositionForAutomaticSchedule(turn);
+                if (disposition == null) return;
+                JSONObject currentSemantic;
+                try {
+                    currentSemantic = new JSONObject(current.semanticJson);
+                    AutomaticScheduleContract.validateTransition(currentSemantic);
+                } catch (Exception error) {
+                    throw new IllegalStateException("automatic schedule authority conflict", error);
                 }
-                if (!ownsPause && !exactTerminalReplay) return;
-                AutomaticScheduleContract.Policy policy =
-                    automaticPolicyForTurn(turn, currentSemantic);
-                next = schedules.finalizeDirectInternal(
-                    turn.characterId, "chat", epoch, source, policy, disposition, now);
-            } else {
-                AutomaticTaskCoordinator.ClaimToken token = automaticClaimTokenFromTurn(turn);
-                AutomaticScheduleContract.Policy policy =
-                    automaticPolicyForTurn(turn, currentSemantic);
-                next = schedules.finalizeAutomatic(
-                    turn.characterId, moment ? "moment" : "chat", epoch,
-                    token.generation, token.jobId, source, policy, disposition, now);
-            }
-            result.set(new AutomaticFinalization(
-                next.generation > current.generation, previousJobId, next));
+                String deviceId = currentSemantic.optString("deviceId", "");
+                String epoch = currentSemantic.optString("authorityEpoch", "");
+                String resultChecksum = automaticTerminalChecksum(turn, disposition);
+                String sourceType = disposition == AutomaticScheduleContract.TerminalDisposition.FAILED
+                    ? "failure_retry" : (direct ? "direct_terminal" : "proactive_terminal");
+                AutomaticScheduleContract.Source source = new AutomaticScheduleContract.Source(
+                    sourceType,
+                    automaticTerminalSourceId(turn, direct),
+                    resultChecksum,
+                    current.conversationSequence,
+                    automaticTerminalOccurredAt(turn, now));
+                AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, deviceId);
+                String previousJobId = current.activeJobId;
+                AutomaticScheduleAuthorityEntity next;
+                if (direct) {
+                    AutomaticScheduleContract.Source pauseSource = directInputSource(turn);
+                    String currentSourceType = currentSemantic.optString("sourceType", "");
+                    String currentSourceId = currentSemantic.optString("sourceId", "");
+                    String currentSourceChecksum = currentSemantic.optString("sourceChecksum", "");
+                    boolean ownsPause = "direct_input".equals(currentSourceType)
+                        && pauseSource.id.equals(currentSourceId)
+                        && pauseSource.checksum.equals(currentSourceChecksum);
+                    boolean exactTerminalReplay = sourceType.equals(currentSourceType)
+                        && source.id.equals(currentSourceId)
+                        && source.checksum.equals(currentSourceChecksum);
+                    if (sourceType.equals(currentSourceType) && source.id.equals(currentSourceId)
+                        && !source.checksum.equals(currentSourceChecksum)) {
+                        throw new IllegalStateException("automatic schedule source checksum conflict");
+                    }
+                    if (!ownsPause && !exactTerminalReplay) return;
+                    AutomaticScheduleContract.Policy policy =
+                        automaticPolicyForTurn(turn, currentSemantic);
+                    next = schedules.finalizeDirectInternal(
+                        turn.characterId, "chat", epoch, source, policy, disposition, now);
+                } else {
+                    AutomaticTaskCoordinator.ClaimToken token = automaticClaimTokenFromTurn(turn);
+                    AutomaticScheduleContract.Policy policy =
+                        automaticPolicyForTurn(turn, currentSemantic);
+                    next = schedules.finalizeAutomatic(
+                        turn.characterId, moment ? "moment" : "chat", epoch,
+                        token.generation, token.jobId, source, policy, disposition, now);
+                }
+                result.set(new AutomaticFinalization(
+                    next.generation > current.generation, previousJobId, next));
+            });
         });
-        return result.get();
+        return gateCompleted ? result.get() : AutomaticFinalization.stale();
     }
 
     private AutomaticTaskCoordinator.ClaimToken automaticClaimTokenFromTurn(ChatTurnEntity turn) {
@@ -1016,10 +1042,10 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         if (submission == null || submission.turnId == null || submission.turnId.trim().isEmpty()) {
             throw new IllegalArgumentException("turn submission is required");
         }
+        assertRoleAcceptsSemanticWrite(submission.characterId);
         String safeSnapshotJson = snapshotForNewTurn(submission.snapshotJson, submission.characterId);
         ChatTurnEntity existing = dao.turn(submission.turnId);
         if (existing != null) return existing;
-        assertRoleAcceptsSemanticWrite(submission.characterId);
         assertManagedAutomaticSubmission(submission);
         long now = submission.createdAt > 0 ? submission.createdAt : System.currentTimeMillis();
         String attemptId = newAttemptId(submission.turnId, 1);
@@ -2277,7 +2303,12 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         String detail,
         long now
     ) {
-        insertDiagnostic(turnId, attemptId, level, code, detail, now);
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = turnId == null ? null : dao.turn(turnId);
+            if (turn == null && attemptId != null) return;
+            if (turn != null) assertRoleAcceptsSemanticWrite(turn.characterId);
+            insertDiagnostic(turnId, attemptId, level, code, detail, now);
+        });
     }
 
     /**
@@ -3259,8 +3290,10 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         if (expectedCursorChecksum == null || !expectedCursorChecksum.matches("[a-f0-9]{64}")) {
             throw new IllegalArgumentException("expected cursor checksum is invalid");
         }
-        return createRoleDelete(
-            characterId, storeOwnedPeerId, expectedCursorChecksum, backupReceipt,
+        JSONObject verifiedReceipt = LifecycleControlCodec.validateBackupReceipt(backupReceipt);
+        return createRoleDeleteOperation(
+            roleDeleteOperationId(characterId, storeOwnedPeerId, expectedCursorChecksum, verifiedReceipt),
+            characterId, expectedCursorChecksum, verifiedReceipt,
             System.currentTimeMillis(), durableWakePrearm, null);
     }
 
@@ -3277,9 +3310,159 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         if (expectedCursorChecksum == null || !expectedCursorChecksum.matches("[a-f0-9]{64}")) {
             throw new IllegalArgumentException("expected cursor checksum is invalid");
         }
-        return createRoleDelete(
-            characterId, storeOwnedPeerId, expectedCursorChecksum, backupReceipt,
+        JSONObject verifiedReceipt = LifecycleControlCodec.validateBackupReceipt(backupReceipt);
+        return createRoleDeleteOperation(
+            roleDeleteOperationId(characterId, storeOwnedPeerId, expectedCursorChecksum, verifiedReceipt),
+            characterId, expectedCursorChecksum, verifiedReceipt,
             System.currentTimeMillis(), durableWakePrearm, notificationCanceller);
+    }
+
+    public String roleDeleteOperationIdForRequest(
+        String characterId, String expectedCursorChecksum, JSONObject backupReceipt
+    ) {
+        if (storeOwnedPeerId == null || storeOwnedPeerId.isEmpty()) {
+            throw new IllegalStateException("store-owned bridge peer is not configured");
+        }
+        String safeCharacterId = requireCharacterId(characterId);
+        if (expectedCursorChecksum == null || !expectedCursorChecksum.matches("[a-f0-9]{64}")) {
+            throw new IllegalArgumentException("expected cursor checksum is invalid");
+        }
+        JSONObject verifiedReceipt = LifecycleControlCodec.validateBackupReceipt(backupReceipt);
+        return roleDeleteOperationId(
+            safeCharacterId, storeOwnedPeerId, expectedCursorChecksum, verifiedReceipt);
+    }
+
+    private static void validatePersistedRoleDeleteOperation(RoleDeleteOperationEntity row) {
+        if (row == null || row.operationId == null
+            || !row.operationId.matches("rdop_[a-f0-9]{64}")) {
+            throw new IllegalStateException("role delete operation identity conflict");
+        }
+        if (row.controlId == null || row.controlId.trim().isEmpty()
+            || row.characterId == null || row.characterId.trim().isEmpty()) {
+            throw new IllegalStateException("role delete operation target conflict");
+        }
+        Set<String> states = new HashSet<>(Arrays.asList(
+            "prepared", "running", "completed", "failed", "unknown"));
+        Set<String> phases = new HashSet<>(Arrays.asList(
+            "prepared", "freeze_created", "deleting", "complete", "failed", "unknown",
+            "legacy_control_recovered"));
+        if (!states.contains(row.state) || !phases.contains(row.phase)) {
+            throw new IllegalStateException("role delete operation state conflict");
+        }
+        if (("prepared".equals(row.phase) && !"prepared".equals(row.state))
+            || ("freeze_created".equals(row.phase) && !"prepared".equals(row.state))
+            || ("deleting".equals(row.phase) && !"running".equals(row.state))
+            || ("complete".equals(row.phase) && !"completed".equals(row.state))
+            || ("failed".equals(row.phase) && !"failed".equals(row.state))
+            || ("legacy_control_recovered".equals(row.phase)
+                && !("completed".equals(row.state) || "unknown".equals(row.state)))
+            || ("unknown".equals(row.phase) && !"unknown".equals(row.state))) {
+            throw new IllegalStateException("role delete operation state conflict");
+        }
+        if (row.operationChecksum == null || !row.operationChecksum.matches("[a-f0-9]{64}")) {
+            throw new IllegalStateException("role delete operation checksum conflict");
+        }
+        if (row.sourceSnapshotChecksum == null || (!row.sourceSnapshotChecksum.isEmpty()
+            && !row.sourceSnapshotChecksum.matches("[a-f0-9]{64}"))) {
+            throw new IllegalStateException("role delete operation source conflict");
+        }
+        if (row.cursorJson == null || row.cursorJson.length() > 4096) {
+            throw new IllegalStateException("role delete operation cursor conflict");
+        }
+        try {
+            JSONObject cursor = new JSONObject(row.cursorJson);
+            if (!BridgeAuthority.canonicalJson(cursor).equals(row.cursorJson)) {
+                throw new IllegalStateException("role delete operation cursor conflict");
+            }
+            if ("legacy_control_recovered".equals(row.phase)) {
+                if (cursor.length() != 0) {
+                    throw new IllegalStateException("role delete operation cursor conflict");
+                }
+            } else if (cursor.length() != 1 || !cursor.has("expectedCursorChecksum")
+                || !(cursor.get("expectedCursorChecksum") instanceof String)
+                || !((String) cursor.get("expectedCursorChecksum")).matches("[a-f0-9]{64}")) {
+                throw new IllegalStateException("role delete operation cursor conflict");
+            }
+        } catch (Exception error) {
+            throw new IllegalStateException("role delete operation cursor conflict", error);
+        }
+        if (row.affectedCount < 0L
+            || row.createdAt <= 0L || row.updatedAt < row.createdAt
+            || row.createdAt > LifecycleControlSender.MAX_SAFE_INTEGER
+            || row.updatedAt > LifecycleControlSender.MAX_SAFE_INTEGER) {
+            throw new IllegalStateException("role delete operation time conflict");
+        }
+        if (row.lastError != null
+            && !row.lastError.matches("[A-Z][A-Z0-9_]{0,127}")) {
+            throw new IllegalStateException("role delete operation error conflict");
+        }
+        if (("failed".equals(row.state) || "unknown".equals(row.state))
+            && (row.lastError == null || row.lastError.trim().isEmpty())) {
+            throw new IllegalStateException("role delete operation error conflict");
+        }
+        if (("prepared".equals(row.state) || "running".equals(row.state)
+                || "completed".equals(row.state)) && row.lastError != null) {
+            throw new IllegalStateException("role delete operation error conflict");
+        }
+    }
+
+    public RoleDeleteOperationEntity queryRoleDeleteOperation(String operationId) {
+        if (operationId == null || !operationId.matches("rdop_[a-f0-9]{64}")) {
+            throw new IllegalArgumentException("role delete operation id is invalid");
+        }
+        RoleDeleteOperationEntity row = dao.roleDeleteOperation(operationId);
+        if (row == null) return null;
+        validatePersistedRoleDeleteOperation(row);
+        LifecycleControlEntity control = dao.lifecycleControl(row.controlId);
+        if (control == null) throw new IllegalStateException("role delete operation tombstone conflict");
+        validatePersistedLifecycleControl(control);
+        if (!row.characterId.equals(control.characterId)
+            || !LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind)) {
+            throw new IllegalStateException("role delete operation target conflict");
+        }
+        if (!"legacy_control_recovered".equals(row.phase)) {
+            String expectedCursorChecksum = roleDeleteOperationExpectedCursorChecksum(row);
+            String expectedOperationChecksum = roleDeleteOperationChecksum(
+                row.operationId, row.controlId, row.characterId, control.peerId,
+                expectedCursorChecksum, row.sourceSnapshotChecksum, control.semanticChecksum);
+            if (!expectedOperationChecksum.equals(row.operationChecksum)) {
+                throw new IllegalStateException("role delete operation checksum conflict");
+            }
+        }
+        return row;
+    }
+
+    public RoleDeleteOperationEntity queryRoleDeleteOperationForCharacter(String characterId) {
+        LifecycleControl control = roleDeleteControl(characterId);
+        if (control == null) return null;
+        RoleDeleteOperationEntity row = dao.roleDeleteOperationForControl(control.controlId);
+        if (row == null) return null;
+        return queryRoleDeleteOperation(row.operationId);
+    }
+
+    /**
+     * Converts an abandoned prepared/running journal row to an explicit unknown
+     * outcome after a bounded timeout.  It never claims success and never
+     * removes the retained tombstone; a later operator/recovery flow must make
+     * the product decision about retry or repair.
+     */
+    public RoleDeleteOperationEntity reconcileRoleDeleteOperation(
+        String operationId, long now, long timeoutMs
+    ) {
+        if (!safeNonNegative(now) || now == 0L || timeoutMs <= 0L
+            || timeoutMs > LifecycleControlSender.MAX_SAFE_INTEGER) {
+            throw new IllegalArgumentException("role delete reconciliation time is invalid");
+        }
+        RoleDeleteOperationEntity before = queryRoleDeleteOperation(operationId);
+        if (before == null) return null;
+        if (("prepared".equals(before.state) || "running".equals(before.state))
+            && before.updatedAt <= now - timeoutMs) {
+            database.runInTransaction(() -> dao.compareAndSetRoleDeleteOperation(
+                operationId, before.state, "unknown", "unknown", before.cursorJson,
+                before.affectedCount, before.updatedAt, before.cursorJson,
+                before.affectedCount, now, "OPERATION_TIMEOUT_OR_RESTART"));
+        }
+        return queryRoleDeleteOperation(operationId);
     }
 
     public LifecycleControl roleDeleteControl(String characterId) {
@@ -3379,6 +3562,173 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         assertRoleAcceptsSemanticWrite(turn.characterId);
     }
 
+    private static String roleDeleteOperationId(
+        String characterId, String peerId, String expectedCursorChecksum, JSONObject backupReceipt
+    ) {
+        try {
+            JSONObject basis = new JSONObject()
+                .put("contract", "android-role-delete-operation-v1")
+                .put("characterId", characterId)
+                .put("peerId", peerId)
+                .put("expectedCursorChecksum", expectedCursorChecksum)
+                .put("backupReceipt", backupReceipt);
+            return "rdop_" + BridgeAuthority.sha256CanonicalJson(basis);
+        } catch (Exception error) {
+            throw new IllegalStateException("role delete operation identity conflict", error);
+        }
+    }
+
+    private static String roleDeleteOperationCursor(String expectedCursorChecksum) {
+        try {
+            return BridgeAuthority.canonicalJson(new JSONObject()
+                .put("expectedCursorChecksum", expectedCursorChecksum));
+        } catch (Exception error) {
+            throw new IllegalStateException("role delete operation cursor conflict", error);
+        }
+    }
+
+    private static String roleDeleteOperationExpectedCursorChecksum(RoleDeleteOperationEntity row) {
+        try {
+            JSONObject cursor = new JSONObject(row.cursorJson);
+            if (cursor.length() != 1 || !cursor.has("expectedCursorChecksum")
+                || !(cursor.get("expectedCursorChecksum") instanceof String)) {
+                throw new IllegalStateException("role delete operation cursor conflict");
+            }
+            String checksum = cursor.getString("expectedCursorChecksum");
+            if (!checksum.matches("[a-f0-9]{64}")) {
+                throw new IllegalStateException("role delete operation cursor conflict");
+            }
+            return checksum;
+        } catch (Exception error) {
+            throw new IllegalStateException("role delete operation cursor conflict", error);
+        }
+    }
+
+    private static String roleDeleteOperationChecksum(
+        String operationId, String controlId, String characterId, String peerId,
+        String cursorChecksum, String sourceSnapshotChecksum, String semanticChecksum
+    ) {
+        try {
+            JSONObject basis = new JSONObject()
+                .put("contract", "android-role-delete-operation-v1")
+                .put("operationId", operationId)
+                .put("controlId", controlId)
+                .put("characterId", characterId)
+                .put("peerId", peerId)
+                .put("cursorChecksum", cursorChecksum)
+                .put("sourceSnapshotChecksum", sourceSnapshotChecksum)
+                .put("semanticChecksum", semanticChecksum);
+            return BridgeAuthority.sha256CanonicalJson(basis);
+        } catch (Exception error) {
+            throw new IllegalStateException("role delete operation checksum failed", error);
+        }
+    }
+
+    private LifecycleControl prepareRoleDeleteOperation(
+        String operationId, String characterId, String peerId, String expectedCursorChecksum,
+        JSONObject backupReceipt, long requestedAt, boolean[] shouldExecute
+    ) {
+        AtomicReference<LifecycleControl> result = new AtomicReference<>();
+        database.runInTransaction(() -> {
+            RoleDeleteOperationEntity existingOperation = dao.roleDeleteOperation(operationId);
+            if (existingOperation != null) {
+                validatePersistedRoleDeleteOperation(existingOperation);
+                if (!characterId.equals(existingOperation.characterId)) {
+                    throw new IllegalStateException("role delete operation identity conflict");
+                }
+                LifecycleControlEntity existingControl = dao.lifecycleControl(existingOperation.controlId);
+                if (existingControl == null) {
+                    throw new IllegalStateException("role delete operation tombstone conflict");
+                }
+                validatePersistedLifecycleControl(existingControl);
+                if (!"legacy_control_recovered".equals(existingOperation.phase)) {
+                    String expectedExistingCursor = roleDeleteOperationExpectedCursorChecksum(existingOperation);
+                    String expectedExistingOperationChecksum = roleDeleteOperationChecksum(
+                        existingOperation.operationId, existingOperation.controlId,
+                        existingOperation.characterId, existingControl.peerId,
+                        expectedExistingCursor, existingOperation.sourceSnapshotChecksum,
+                        existingControl.semanticChecksum);
+                    if (!expectedExistingOperationChecksum.equals(existingOperation.operationChecksum)) {
+                        throw new IllegalStateException("role delete operation checksum conflict");
+                    }
+                }
+                if ("completed".equals(existingOperation.state)) {
+                    shouldExecute[0] = false;
+                    result.set(LifecycleControl.fromEntity(existingControl));
+                    return;
+                }
+                throw new IllegalStateException("role delete operation already in progress");
+            }
+
+            List<LifecycleControlEntity> existingControls =
+                dao.roleDeleteControlsForCharacter(characterId);
+            if (!existingControls.isEmpty()) {
+                if (existingControls.size() != 1) {
+                    throw new IllegalStateException("role delete authority set conflict");
+                }
+                LifecycleControlEntity existing = existingControls.get(0);
+                validatePersistedLifecycleControl(existing);
+                RoleDeleteOperationEntity migrated = new RoleDeleteOperationEntity();
+                migrated.operationId = operationId;
+                migrated.controlId = existing.controlId;
+                migrated.characterId = characterId;
+                migrated.operationChecksum = roleDeleteOperationChecksum(
+                    operationId, existing.controlId, characterId, peerId,
+                    expectedCursorChecksum, "", existing.semanticChecksum);
+                migrated.state = LifecycleControl.APPLIED.equals(existing.state)
+                    ? "completed" : "unknown";
+                migrated.phase = "legacy_control_recovered";
+                migrated.cursorJson = "{}";
+                migrated.sourceSnapshotChecksum = "";
+                migrated.lastError = LifecycleControl.APPLIED.equals(existing.state)
+                    ? null : "LEGACY_CONTROL_OPERATION_UNKNOWN";
+                migrated.createdAt = existing.requestedAt;
+                migrated.updatedAt = Math.max(existing.updatedAt, requestedAt);
+                if (dao.insertRoleDeleteOperation(migrated) != 1L) {
+                    throw new IllegalStateException("role delete operation migration conflict");
+                }
+                shouldExecute[0] = false;
+                result.set(LifecycleControl.fromEntity(existing));
+                return;
+            }
+
+            ConversationCursorEntity cursor = dao.conversationCursor(characterId);
+            String currentCursorChecksum = conversationCursorChecksum(characterId, cursor);
+            if (!expectedCursorChecksum.equals(currentCursorChecksum)) {
+                throw new IllegalStateException("role delete cursor conflict");
+            }
+            LifecycleControlCodec.Encoded encoded;
+            try {
+                encoded = LifecycleControlCodec.encodeRoleDelete(
+                    characterId, peerId, requestedAt, backupReceipt);
+            } catch (Exception error) {
+                throw new IllegalStateException("role delete semantic conflict", error);
+            }
+            LifecycleControlEntity control = encodedToRoleDeleteEntity(
+                encoded, characterId, peerId, requestedAt);
+            RoleDeleteOperationEntity operation = new RoleDeleteOperationEntity();
+            operation.operationId = operationId;
+            operation.controlId = control.controlId;
+            operation.characterId = characterId;
+            operation.operationChecksum = roleDeleteOperationChecksum(
+                operationId, control.controlId, characterId, peerId, expectedCursorChecksum,
+                backupReceipt.optString("logicalChecksum", ""), control.semanticChecksum);
+            operation.state = "prepared";
+            operation.phase = "freeze_created";
+            operation.cursorJson = roleDeleteOperationCursor(expectedCursorChecksum);
+            operation.sourceSnapshotChecksum = backupReceipt.optString("logicalChecksum", "");
+            operation.createdAt = requestedAt;
+            operation.updatedAt = requestedAt;
+            if (dao.insertLifecycleControl(control) != 1L
+                || dao.insertRoleDeleteOperation(operation) != 1L) {
+                throw new IllegalStateException("role delete operation prepare conflict");
+            }
+            shouldExecute[0] = true;
+            result.set(LifecycleControl.fromEntity(control));
+        });
+        return result.get();
+    }
+
     LifecycleControl createRoleDelete(
         String characterId,
         String peerId,
@@ -3387,12 +3737,201 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         long requestedAt,
         Runnable durableWakePrearm
     ) {
-        return createRoleDelete(
+        return legacyCreateRoleDelete(
             characterId, peerId, expectedCursorChecksum, backupReceipt, requestedAt,
             durableWakePrearm, null);
     }
 
     LifecycleControl createRoleDelete(
+        String characterId,
+        String peerId,
+        String expectedCursorChecksum,
+        JSONObject backupReceipt,
+        long requestedAt,
+        Runnable durableWakePrearm,
+        RoleDeletionDispatchPolicy.NotificationCanceller notificationCanceller
+    ) {
+        return legacyCreateRoleDelete(
+            characterId, peerId, expectedCursorChecksum, backupReceipt, requestedAt,
+            durableWakePrearm, notificationCanceller);
+    }
+
+    public LifecycleControl createRoleDeleteOperation(
+        String operationId,
+        String characterId,
+        String expectedCursorChecksum,
+        JSONObject backupReceipt,
+        long requestedAt,
+        Runnable durableWakePrearm,
+        RoleDeletionDispatchPolicy.NotificationCanceller notificationCanceller
+    ) {
+        if (storeOwnedPeerId == null || storeOwnedPeerId.isEmpty()) {
+            throw new IllegalStateException("store-owned bridge peer is not configured");
+        }
+        return createRoleDelete(
+            operationId, characterId, storeOwnedPeerId, expectedCursorChecksum,
+            backupReceipt, requestedAt, durableWakePrearm, notificationCanceller);
+    }
+
+    LifecycleControl createRoleDelete(
+        String operationId,
+        String characterId,
+        String peerId,
+        String expectedCursorChecksum,
+        JSONObject backupReceipt,
+        long requestedAt,
+        Runnable durableWakePrearm,
+        RoleDeletionDispatchPolicy.NotificationCanceller notificationCanceller
+    ) {
+        String safeCharacterId = requireCharacterId(characterId);
+        Object roleGate = ROLE_SIDE_EFFECT_GATES.computeIfAbsent(
+            safeCharacterId, ignored -> new Object());
+        synchronized (roleGate) {
+            return createRoleDeleteOperationInternal(
+                operationId, safeCharacterId, peerId, expectedCursorChecksum, backupReceipt,
+                requestedAt, durableWakePrearm, notificationCanceller);
+        }
+    }
+
+    private LifecycleControl createRoleDeleteOperationInternal(
+        String operationId,
+        String characterId,
+        String peerId,
+        String expectedCursorChecksum,
+        JSONObject backupReceipt,
+        long requestedAt,
+        Runnable durableWakePrearm,
+        RoleDeletionDispatchPolicy.NotificationCanceller notificationCanceller
+    ) {
+        if (operationId == null || !operationId.matches("rdop_[a-f0-9]{64}")) {
+            throw new IllegalArgumentException("role delete operation id is invalid");
+        }
+        if (requestedAt <= 0L || requestedAt > LifecycleControlSender.MAX_SAFE_INTEGER) {
+            throw new IllegalArgumentException("requestedAt is invalid");
+        }
+        JSONObject verifiedReceipt = LifecycleControlCodec.validateBackupReceipt(backupReceipt);
+        String safeCharacterId = requireCharacterId(characterId);
+        String expectedOperationId = roleDeleteOperationId(
+            safeCharacterId, peerId, expectedCursorChecksum, verifiedReceipt);
+        if (!expectedOperationId.equals(operationId)) {
+            throw new IllegalStateException("role delete operation identity conflict");
+        }
+        boolean[] shouldExecute = {false};
+        LifecycleControl prepared = prepareRoleDeleteOperation(
+            operationId, safeCharacterId, peerId, expectedCursorChecksum,
+            verifiedReceipt, requestedAt, shouldExecute);
+        if (!shouldExecute[0]) return prepared;
+
+        database.runInTransaction(() -> {
+            RoleDeleteOperationEntity operation = dao.roleDeleteOperation(operationId);
+            if (operation == null || !"prepared".equals(operation.state)
+                || dao.compareAndSetRoleDeleteOperation(
+                    operationId, "prepared", "running", "deleting", operation.cursorJson,
+                    operation.affectedCount, operation.updatedAt, operation.cursorJson,
+                    0L, requestedAt, null) != 1) {
+                throw new IllegalStateException("role delete operation state conflict");
+            }
+        });
+
+        LifecycleControl completedControl;
+        long affectedTurns = dao.turnIdsForCharacter(characterId).size();
+        try {
+            completedControl = executePreparedRoleDelete(
+                operationId, characterId, peerId, expectedCursorChecksum,
+                requestedAt, durableWakePrearm);
+            database.runInTransaction(() -> {
+                RoleDeleteOperationEntity operation = dao.roleDeleteOperation(operationId);
+                if (operation == null
+                    || dao.compareAndSetRoleDeleteOperation(
+                        operationId, "running", "completed", "complete", operation.cursorJson,
+                        operation.affectedCount, operation.updatedAt, operation.cursorJson,
+                        affectedTurns, requestedAt, null) != 1) {
+                    throw new IllegalStateException("role delete completion state conflict");
+                }
+            });
+        } catch (RuntimeException error) {
+            String errorCode = "ROLE_DELETE_OPERATION_FAILED";
+            database.runInTransaction(() -> {
+                RoleDeleteOperationEntity operation = dao.roleDeleteOperation(operationId);
+                if (operation != null) {
+                    dao.compareAndSetRoleDeleteOperation(
+                        operationId, "running", "failed", "failed", operation.cursorJson,
+                        operation.affectedCount, operation.updatedAt, operation.cursorJson,
+                        affectedTurns, requestedAt, errorCode);
+                }
+            });
+            throw error;
+        }
+        if (notificationCanceller != null) {
+            drainPendingRoleNotificationCancellations(notificationCanceller);
+        }
+        return completedControl;
+    }
+
+    private LifecycleControl executePreparedRoleDelete(
+        String operationId,
+        String characterId,
+        String peerId,
+        String expectedCursorChecksum,
+        long requestedAt,
+        Runnable durableWakePrearm
+    ) {
+        AtomicReference<LifecycleControl> result = new AtomicReference<>();
+        database.runInTransaction(() -> {
+            RoleDeleteOperationEntity operation = dao.roleDeleteOperation(operationId);
+            if (operation == null || !"running".equals(operation.state)) {
+                throw new IllegalStateException("role delete operation state conflict");
+            }
+            LifecycleControlEntity row = dao.lifecycleControl(operation.controlId);
+            if (row == null || !characterId.equals(row.characterId)
+                || !peerId.equals(row.peerId)) {
+                throw new IllegalStateException("role delete operation tombstone conflict");
+            }
+            validatePersistedLifecycleControl(row);
+            ConversationCursorEntity cursor = dao.conversationCursor(characterId);
+            if (!expectedCursorChecksum.equals(conversationCursorChecksum(characterId, cursor))) {
+                throw new IllegalStateException("role delete cursor conflict");
+            }
+
+            List<String> roleTurnIds = dao.turnIdsForCharacter(characterId);
+            new AutomaticScheduleStore(database, peerId, automaticScheduleFaultAfterWrite)
+                .disableForRoleDeleteInTransaction(
+                    characterId, row.controlId, row.semanticChecksum, requestedAt);
+            insertRoleNotificationCancellationIntents(
+                row.controlId, characterId, roleTurnIds, requestedAt);
+            terminalFaultHook.after("role_delete_control");
+
+            dao.deleteAnnotationsForRole(characterId);
+            dao.deleteDiagnosticsForRole(characterId);
+            dao.deleteChangesForRole(characterId);
+            dao.deleteRawMessagesForRole(characterId);
+            dao.deleteReplyPartsForRole(characterId);
+            dao.deleteAttemptsForRole(characterId);
+            dao.deleteTurnsForRole(characterId);
+            terminalFaultHook.after("role_delete_turn_children");
+
+            dao.deleteMemoryForRole(characterId);
+            dao.deleteEvidenceForRole(characterId);
+            dao.deleteSnapshotsForRole(characterId);
+            dao.deleteRolePlanOccurrencesForRole(characterId);
+            dao.deleteRolePlanHistoryForCharacter(characterId);
+            dao.deleteRolePlansForCharacter(characterId);
+            terminalFaultHook.after("role_delete_role_data");
+
+            dao.deleteConversationAuthoritiesForRole(characterId);
+            dao.deleteConversationCursorForRole(characterId);
+            terminalFaultHook.after("role_delete_authority");
+
+            dao.deletePriorLifecycleAckTombstonesForRole(characterId, row.controlId);
+            dao.deletePriorLifecycleControlsForRole(characterId, row.controlId);
+            terminalFaultHook.after("role_delete_lifecycle");
+            if (durableWakePrearm != null) durableWakePrearm.run();
+            result.set(LifecycleControl.fromEntity(row));
+        });
+        return result.get();
+    }
+
+    private LifecycleControl legacyCreateRoleDelete(
         String characterId,
         String peerId,
         String expectedCursorChecksum,
@@ -4317,17 +4856,22 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         AttemptStage stage,
         long now
     ) {
-        dao.markStage(turnId, attemptId, state.name(), stage.name(), now);
-        String code = state == TurnState.MEMORY_RUNNING ? "MEMORY_STARTED"
-            : state == TurnState.CHAT_RUNNING ? "CHAT_STARTED"
-            : "STAGE_CHANGED";
-        insertDiagnostic(turnId, attemptId, "INFO", code, state.name(), now);
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = requireTurn(turnId);
+            assertRoleAcceptsSemanticWrite(turn.characterId);
+            dao.markStage(turnId, attemptId, state.name(), stage.name(), now);
+            String code = state == TurnState.MEMORY_RUNNING ? "MEMORY_STARTED"
+                : state == TurnState.CHAT_RUNNING ? "CHAT_STARTED"
+                : "STAGE_CHANGED";
+            insertDiagnostic(turnId, attemptId, "INFO", code, state.name(), now);
+        });
     }
 
     @Override
     public void markBridgeWaiting(String turnId, String attemptId, String route, long now) {
         database.runInTransaction(() -> {
             ChatTurnEntity turn = requireTurn(turnId);
+            assertRoleAcceptsSemanticWrite(turn.characterId);
             if (!attemptId.equals(turn.activeAttemptId)
                 || !TurnState.MEMORY_RUNNING.name().equals(turn.state)) {
                 throw new StaleAttemptException(turnId, attemptId);
@@ -4354,20 +4898,29 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
 
     @Override
     public void saveMemoryResult(String turnId, String attemptId, String memory, long now) {
-        dao.saveMemoryCheckpoint(turnId, attemptId, memory, now);
-        insertDiagnostic(turnId, attemptId, "INFO", "MEMORY_DONE", "memory checkpoint saved", now);
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = requireTurn(turnId);
+            assertRoleAcceptsSemanticWrite(turn.characterId);
+            dao.saveMemoryCheckpoint(turnId, attemptId, memory, now);
+            insertDiagnostic(turnId, attemptId, "INFO", "MEMORY_DONE", "memory checkpoint saved", now);
+        });
     }
 
     @Override
     public void saveRawReply(String turnId, String attemptId, String rawReply, long now) {
-        dao.saveRawReplyCheckpoint(turnId, attemptId, rawReply, now);
-        insertDiagnostic(turnId, attemptId, "INFO", "CHAT_DONE", "chat checkpoint saved", now);
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = requireTurn(turnId);
+            assertRoleAcceptsSemanticWrite(turn.characterId);
+            dao.saveRawReplyCheckpoint(turnId, attemptId, rawReply, now);
+            insertDiagnostic(turnId, attemptId, "INFO", "CHAT_DONE", "chat checkpoint saved", now);
+        });
     }
 
     @Override
     public void markInterrupted(String turnId, String attemptId, String code, long now) {
         database.runInTransaction(() -> {
             ChatTurnEntity turn = requireTurn(turnId);
+            assertRoleAcceptsSemanticWrite(turn.characterId);
             if (!attemptId.equals(turn.activeAttemptId)) {
                 throw new StaleAttemptException(turnId, attemptId);
             }

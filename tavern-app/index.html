@@ -13379,8 +13379,15 @@ async function clearCurrentChat() {
 }
 
 const ROLE_DELETE_CONTROL_STATES = new Set(['waiting', 'pending', 'relay_accepted', 'applied', 'quarantined']);
+const ROLE_DELETE_OPERATION_STATES = new Set(['none', 'prepared', 'running', 'completed', 'failed', 'unknown']);
+const ROLE_DELETE_OPERATION_PHASES = new Set(['', 'prepared', 'freeze_created', 'deleting', 'complete', 'failed', 'unknown', 'legacy_control_recovered']);
 const ROLE_DELETE_CONTROL_KEYS = Object.freeze([
   'characterId', 'controlId', 'state', 'requestedAt', 'appliedAt', 'semanticChecksum'
+]);
+const ROLE_DELETE_OPERATION_KEYS = Object.freeze([
+  ...ROLE_DELETE_CONTROL_KEYS,
+  'operationId', 'operationState', 'operationPhase', 'operationChecksum',
+  'affectedCount', 'operationUpdatedAt', 'lastError'
 ]);
 
 function roleDeletionFrozen(charId) {
@@ -13435,13 +13442,49 @@ async function assertNativeRoleDeletionAllowsStateReplacement(
 }
 
 function validateNativeRoleDeleteControl(charId, raw, { allowNone = false } = {}) {
+  const keys = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? Object.keys(raw).sort().join('|') : '';
+  const legacyKeys = ROLE_DELETE_CONTROL_KEYS.slice().sort().join('|');
+  const operationKeys = ROLE_DELETE_OPERATION_KEYS.slice().sort().join('|');
+  const hasOperation = keys === operationKeys;
+  const operationPairValid = !hasOperation || (
+    (raw.operationState === 'none' && raw.operationPhase === '')
+    || (raw.operationState === 'prepared' && ['prepared', 'freeze_created'].includes(raw.operationPhase))
+    || (raw.operationState === 'running' && raw.operationPhase === 'deleting')
+    || (raw.operationState === 'completed' && ['complete', 'legacy_control_recovered'].includes(raw.operationPhase))
+    || (raw.operationState === 'failed' && raw.operationPhase === 'failed')
+    || (raw.operationState === 'unknown' && ['unknown', 'legacy_control_recovered'].includes(raw.operationPhase))
+  );
+  const operationErrorValid = !hasOperation || (
+    ['failed', 'unknown'].includes(raw.operationState)
+      ? typeof raw.lastError === 'string' && /^[A-Z][A-Z0-9_]{0,127}$/.test(raw.lastError)
+      : raw.lastError === null
+  );
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)
-    || Object.keys(raw).sort().join('|') !== ROLE_DELETE_CONTROL_KEYS.slice().sort().join('|')
-    || raw.characterId !== charId || typeof raw.state !== 'string') {
+    || (keys !== legacyKeys && !hasOperation)
+    || raw.characterId !== charId || typeof raw.state !== 'string'
+    || !operationPairValid || !operationErrorValid) {
     throw new Error('invalid native role deletion response');
   }
+  if (hasOperation) {
+    const operationIsNone = raw.operationState === 'none';
+    if (!ROLE_DELETE_OPERATION_STATES.has(raw.operationState)
+      || !ROLE_DELETE_OPERATION_PHASES.has(raw.operationPhase)
+      || (operationIsNone
+        ? (raw.operationId !== '' || raw.operationChecksum !== '' || raw.operationUpdatedAt !== 0
+          || raw.affectedCount !== 0 || raw.lastError !== null)
+        : (typeof raw.operationId !== 'string' || !/^rdop_[a-f0-9]{64}$/.test(raw.operationId)
+          || typeof raw.operationChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(raw.operationChecksum)
+          || typeof raw.operationUpdatedAt !== 'number' || !Number.isSafeInteger(raw.operationUpdatedAt)
+          || raw.operationUpdatedAt <= 0 || typeof raw.affectedCount !== 'number'
+          || !Number.isSafeInteger(raw.affectedCount) || raw.affectedCount < 0
+          || (raw.lastError !== null && typeof raw.lastError !== 'string')))) {
+      throw new Error('invalid native role deletion response');
+    }
+  }
   if (allowNone && raw.state === 'none') {
-    if (raw.controlId !== '' || raw.requestedAt !== 0 || raw.appliedAt !== null || raw.semanticChecksum !== '') {
+    if (raw.controlId !== '' || raw.requestedAt !== 0 || raw.appliedAt !== null || raw.semanticChecksum !== ''
+      || (hasOperation && raw.operationState !== 'none')) {
       throw new Error('invalid native role deletion response');
     }
     return raw;
@@ -13547,7 +13590,14 @@ function markRoleDeletePending(charId, control) {
     state: control.state,
     semanticChecksum: control.semanticChecksum,
     requestedAt: control.requestedAt,
-    appliedAt: control.appliedAt
+    appliedAt: control.appliedAt,
+    operationId: control.operationId || '',
+    operationState: control.operationState || 'none',
+    operationPhase: control.operationPhase || '',
+    operationChecksum: control.operationChecksum || '',
+    affectedCount: control.affectedCount || 0,
+    operationUpdatedAt: control.operationUpdatedAt || 0,
+    lastError: control.lastError || null
   };
   DB.set('characters', characters);
   return true;
@@ -13602,15 +13652,27 @@ async function nativeFirstRoleDelete(charId, { plugin = nativeExecutionPlugin() 
   if (!backupReceipt || typeof backupReceipt !== 'object' || Array.isArray(backupReceipt)) {
     throw new Error('invalid verified backup receipt');
   }
-  const control = await nativeBridgeCall(
-    plugin.createRoleDelete({
-      characterId: charId,
-      expectedCursorChecksum: cursorChecksum,
-      backupReceiptJson: JSON.stringify(backupReceipt)
-    }),
-    'createRoleDelete',
-    5000
-  );
+  let control;
+  try {
+    control = await nativeBridgeCall(
+      plugin.createRoleDelete({
+        characterId: charId,
+        expectedCursorChecksum: cursorChecksum,
+        backupReceiptJson: JSON.stringify(backupReceipt)
+      }),
+      'createRoleDelete',
+      5000
+    );
+  } catch (error) {
+    if (!String(error?.message || '').includes('createRoleDelete timed out')) throw error;
+    try {
+      const observed = await roleDeleteControlStatus(charId, plugin);
+      if (observed.state === 'none') throw error;
+      control = observed;
+    } catch (statusError) {
+      throw error;
+    }
+  }
   return validateNativeRoleDeleteControl(charId, control);
 }
 
@@ -13706,7 +13768,14 @@ async function restorePendingRoleDeletions() {
     }
     const previous = char.roleDeletePending || {};
     if (previous.controlId !== control.controlId || previous.state !== control.state
-      || previous.semanticChecksum !== control.semanticChecksum || previous.appliedAt !== control.appliedAt) {
+      || previous.semanticChecksum !== control.semanticChecksum || previous.appliedAt !== control.appliedAt
+      || previous.operationId !== (control.operationId || '')
+      || previous.operationState !== (control.operationState || 'none')
+      || previous.operationPhase !== (control.operationPhase || '')
+      || previous.operationChecksum !== (control.operationChecksum || '')
+      || previous.affectedCount !== (control.affectedCount || 0)
+      || previous.operationUpdatedAt !== (control.operationUpdatedAt || 0)
+      || previous.lastError !== (control.lastError || null)) {
       markRoleDeletePending(char.id, control);
       changed = true;
     }

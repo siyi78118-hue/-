@@ -922,17 +922,24 @@ public final class AlExecutionService extends Service {
         row.nextRunAt = plan.has("nextRunAt") && !plan.isNull("nextRunAt") ? plan.optLong("nextRunAt") : null;
         row.updatedAt = now;
         row.planJson = plan.toString();
-        database.executionDao().upsertRolePlans(Collections.singletonList(row));
-        if (row.nextRunAt != null) RolePlanAlarmScheduler.schedule(this, row.planId, row.nextRunAt);
-
         snapshot.put("rolePlan", plan);
         snapshot.put("cloudJobId", jobId == null ? "" : jobId);
         String snapshotId = turn.characterId + ":role-plan:" + row.planId;
-        CharacterSnapshotEntity stable = database.executionDao().latestSnapshot(snapshotId);
-        if (stable != null) {
-            stable.contextJson = snapshot.toString();
-            stable.createdAt = now;
-            database.executionDao().upsertSnapshot(stable);
+        database.runInTransaction(() -> {
+            executionStore.assertRoleAcceptsSemanticWrite(turn.characterId);
+            database.executionDao().upsertRolePlans(Collections.singletonList(row));
+            CharacterSnapshotEntity stable = database.executionDao().latestSnapshot(snapshotId);
+            if (stable != null) {
+                stable.contextJson = snapshot.toString();
+                stable.createdAt = now;
+                database.executionDao().upsertSnapshot(stable);
+            }
+        });
+        if (row.nextRunAt != null) {
+            boolean scheduled = executionStore.runRoleSideEffectIfNotDeleted(
+                turn.characterId,
+                () -> RolePlanAlarmScheduler.schedule(this, row.planId, row.nextRunAt));
+            if (!scheduled) throw new IllegalStateException("role delete tombstone prevents role plan continuation");
         }
     }
 

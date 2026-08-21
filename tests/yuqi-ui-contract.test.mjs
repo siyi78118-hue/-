@@ -439,6 +439,8 @@ test('Android role deletion is backup-first, remains visible while pending, and 
     deletion.indexOf('async function enforceNativeRoleDeletionTombstones')
   );
   assert.ok(nativeFirstDelete.indexOf('requestVerifiedYuqiBackup') < nativeFirstDelete.indexOf('createRoleDelete'));
+  assert.match(nativeFirstDelete, /createRoleDelete timed out/);
+  assert.ok(nativeFirstDelete.indexOf('roleDeleteControlStatus') > nativeFirstDelete.indexOf('createRoleDelete timed out'));
   assert.match(deletion, /roleDeletePending/);
   const deleteCurrentRole = deletion.slice(
     deletion.indexOf('async function deleteCurrentRole'),

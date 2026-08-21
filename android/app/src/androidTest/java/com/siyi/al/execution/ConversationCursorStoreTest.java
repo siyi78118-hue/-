@@ -373,7 +373,14 @@ public class ConversationCursorStoreTest {
             + "'{\"message\":\"原样保留\"}', '{\"snapshot\":\"旧值\"}', 103, 104)");
 
         AlExecutionDatabase.MIGRATION_15_16.migrate(db);
+        AlExecutionDatabase.MIGRATION_16_17.migrate(db);
+        AlExecutionDatabase.MIGRATION_16_17.migrate(db);
 
+        assertTrue(hasTable(db, "role_delete_operations"));
+        assertTrue(hasColumn(db, "role_delete_operations", "operationId"));
+        assertTrue(hasColumn(db, "role_delete_operations", "control_id"));
+        assertTrue(hasColumn(db, "role_delete_operations", "updatedAt"));
+        assertEquals(0L, count(db, "role_delete_operations"));
         assertTrue(hasTable(db, "automatic_schedule_authorities"));
         assertTrue(hasTable(db, "automatic_schedule_outbox"));
         assertTrue(hasTable(db, "automatic_schedule_events"));
@@ -473,37 +480,39 @@ public class ConversationCursorStoreTest {
                 AlExecutionDatabase.MIGRATION_12_13,
                 AlExecutionDatabase.MIGRATION_13_14,
                 AlExecutionDatabase.MIGRATION_14_15,
-                AlExecutionDatabase.MIGRATION_15_16)
+                AlExecutionDatabase.MIGRATION_15_16, AlExecutionDatabase.MIGRATION_16_17)
             .allowMainThreadQueries().build();
         SupportSQLiteDatabase upgraded = current.getOpenHelper().getWritableDatabase();
-        assertEquals(16L, userVersion(upgraded));
+        assertEquals(17L, userVersion(upgraded));
         assertEquals(1L, count(upgraded, "chat_turns"));
         assertTrue(hasTable(upgraded, "role_notification_cancellations"));
         current.close();
 
         AlExecutionDatabase reopened = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
-            .addMigrations(AlExecutionDatabase.MIGRATION_14_15, AlExecutionDatabase.MIGRATION_15_16)
+            .addMigrations(AlExecutionDatabase.MIGRATION_14_15, AlExecutionDatabase.MIGRATION_15_16, AlExecutionDatabase.MIGRATION_16_17)
             .allowMainThreadQueries().build();
-        assertEquals(16L, userVersion(reopened.getOpenHelper().getWritableDatabase()));
+        assertEquals(17L, userVersion(reopened.getOpenHelper().getWritableDatabase()));
+        assertTrue(hasTable(reopened.getOpenHelper().getWritableDatabase(), "role_delete_operations"));
         reopened.close();
         context.deleteDatabase(databaseName);
 
         String freshName = "cursor-fresh-v16-" + System.nanoTime();
         AlExecutionDatabase fresh = Room.databaseBuilder(context, AlExecutionDatabase.class, freshName)
             .allowMainThreadQueries().build();
-        assertEquals(16L, userVersion(fresh.getOpenHelper().getWritableDatabase()));
+        assertEquals(17L, userVersion(fresh.getOpenHelper().getWritableDatabase()));
         assertTrue(hasTable(fresh.getOpenHelper().getWritableDatabase(), "role_notification_cancellations"));
+        assertTrue(hasTable(fresh.getOpenHelper().getWritableDatabase(), "role_delete_operations"));
         assertTrue(hasTable(fresh.getOpenHelper().getWritableDatabase(), "automatic_schedule_authorities"));
         assertTrue(hasTable(fresh.getOpenHelper().getWritableDatabase(), "automatic_schedule_outbox"));
         assertTrue(hasTable(fresh.getOpenHelper().getWritableDatabase(), "automatic_schedule_events"));
         fresh.close();
         context.deleteDatabase(freshName);
 
-        String newerName = "cursor-newer-v17-" + System.nanoTime();
+        String newerName = "cursor-newer-v18-" + System.nanoTime();
         SupportSQLiteOpenHelper helper16 = new FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(context)
                 .name(newerName)
-                .callback(new SupportSQLiteOpenHelper.Callback(17) {
+                .callback(new SupportSQLiteOpenHelper.Callback(18) {
                     @Override public void onCreate(SupportSQLiteDatabase db) { }
                     @Override public void onUpgrade(SupportSQLiteDatabase db, int oldVersion, int newVersion) { }
                 })
@@ -567,10 +576,10 @@ public class ConversationCursorStoreTest {
                 AlExecutionDatabase.MIGRATION_12_13,
                 AlExecutionDatabase.MIGRATION_13_14,
                 AlExecutionDatabase.MIGRATION_14_15,
-                AlExecutionDatabase.MIGRATION_15_16)
+                AlExecutionDatabase.MIGRATION_15_16, AlExecutionDatabase.MIGRATION_16_17)
             .allowMainThreadQueries().build();
         SupportSQLiteDatabase upgraded = current.getOpenHelper().getWritableDatabase();
-        assertEquals(16L, userVersion(upgraded));
+        assertEquals(17L, userVersion(upgraded));
         assertEquals(1L, count(upgraded, "chat_turns"));
         assertTrue(hasTable(upgraded, "lifecycle_inbound_ack_tombstones"));
         assertTrue(hasTable(upgraded, "role_notification_cancellations"));
@@ -582,9 +591,9 @@ public class ConversationCursorStoreTest {
             .addMigrations(
                 AlExecutionDatabase.MIGRATION_13_14,
                 AlExecutionDatabase.MIGRATION_14_15,
-                AlExecutionDatabase.MIGRATION_15_16)
+                AlExecutionDatabase.MIGRATION_15_16, AlExecutionDatabase.MIGRATION_16_17)
             .allowMainThreadQueries().build();
-        assertEquals(16L, userVersion(reopened.getOpenHelper().getWritableDatabase()));
+        assertEquals(17L, userVersion(reopened.getOpenHelper().getWritableDatabase()));
         assertEquals(1L, count(reopened.getOpenHelper().getWritableDatabase(), "chat_turns"));
         assertEquals(0L, count(reopened.getOpenHelper().getWritableDatabase(), "automatic_schedule_authorities"));
         reopened.close();
@@ -637,7 +646,7 @@ public class ConversationCursorStoreTest {
         SupportSQLiteOpenHelper helper17 = new FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(context)
                 .name(databaseName)
-                .callback(new SupportSQLiteOpenHelper.Callback(17) {
+                .callback(new SupportSQLiteOpenHelper.Callback(18) {
                     @Override public void onCreate(SupportSQLiteDatabase db) { }
                     @Override public void onUpgrade(SupportSQLiteDatabase db, int oldVersion, int newVersion) { }
                 })

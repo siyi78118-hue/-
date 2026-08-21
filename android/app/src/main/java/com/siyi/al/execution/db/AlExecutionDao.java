@@ -26,6 +26,26 @@ public interface AlExecutionDao {
     long insertLifecycleInboundAckTombstone(LifecycleInboundAckTombstoneEntity tombstone);
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
+    long insertRoleDeleteOperation(RoleDeleteOperationEntity operation);
+
+    @Query("SELECT * FROM role_delete_operations WHERE operationId = :operationId LIMIT 1")
+    RoleDeleteOperationEntity roleDeleteOperation(String operationId);
+
+    @Query("SELECT COUNT(*) FROM role_delete_operations")
+    long roleDeleteOperationCount();
+
+    @Query("SELECT * FROM role_delete_operations ORDER BY operationId ASC")
+    List<RoleDeleteOperationEntity> roleDeleteOperations();
+
+    @Query("SELECT * FROM role_delete_operations WHERE control_id = :controlId LIMIT 1")
+    RoleDeleteOperationEntity roleDeleteOperationForControl(String controlId);
+
+    @Query("UPDATE role_delete_operations SET state = :nextState, phase = :nextPhase, cursorJson = :nextCursorJson, affectedCount = :nextAffectedCount, updatedAt = :updatedAt, lastError = :lastError WHERE operationId = :operationId AND state = :expectedState AND updatedAt = :expectedUpdatedAt AND cursorJson = :expectedCursorJson AND affectedCount = :expectedAffectedCount")
+    int compareAndSetRoleDeleteOperation(String operationId, String expectedState, String nextState,
+        String nextPhase, String expectedCursorJson, long expectedAffectedCount, long expectedUpdatedAt,
+        String nextCursorJson, long nextAffectedCount, long updatedAt, String lastError);
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     long insertRoleNotificationCancellation(RoleNotificationCancellationEntity cancellation);
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)

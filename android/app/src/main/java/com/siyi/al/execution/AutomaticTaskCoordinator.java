@@ -167,11 +167,20 @@ public final class AutomaticTaskCoordinator {
                     AutomaticTaskAlarmScheduler.cancel(context, previousJobId);
                     AlExecutionWakeWorker.cancelAutomatic(context, previousJobId);
                 }
+                if (store.isRoleDeleteTombstoned(authority.characterId)) {
+                    if (authority.activeJobId != null) {
+                        AutomaticTaskAlarmScheduler.cancel(context, authority.activeJobId);
+                        AlExecutionWakeWorker.cancelAutomatic(context, authority.activeJobId);
+                    }
+                    continue;
+                }
                 if (!"scheduled".equals(authority.state) || authority.dueAt == null) continue;
                 ClaimToken token = ClaimToken.from(authority);
-                AutomaticTaskAlarmScheduler.schedule(context, token, authority.dueAt);
-                AlExecutionWakeWorker.enqueueAutomatic(context, token, authority.dueAt);
-                scheduled += 1;
+                boolean allowed = store.runRoleSideEffectIfNotDeleted(authority.characterId, () -> {
+                    AutomaticTaskAlarmScheduler.schedule(context, token, authority.dueAt);
+                    AlExecutionWakeWorker.enqueueAutomatic(context, token, authority.dueAt);
+                });
+                if (allowed) scheduled += 1;
             } catch (Exception ignored) {
                 // Corrupt or obsolete authority never becomes executable work.
             }
@@ -204,8 +213,9 @@ public final class AutomaticTaskCoordinator {
                 ClaimToken token = ClaimToken.from(authority);
                 long now = System.currentTimeMillis();
                 long dueAt = authority.dueAt == null ? now : Math.max(now, authority.dueAt);
-                AlExecutionWakeWorker.enqueueAutomatic(context, token, dueAt);
-                scheduled += 1;
+                boolean allowed = store.runRoleSideEffectIfNotDeleted(authority.characterId,
+                    () -> AlExecutionWakeWorker.enqueueAutomatic(context, token, dueAt));
+                if (allowed) scheduled += 1;
             } catch (RuntimeException ignored) {
                 // Malformed/foreign durable rows fail closed without creating work.
             }

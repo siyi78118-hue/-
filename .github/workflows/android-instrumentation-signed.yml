@@ -1,0 +1,85 @@
+name: Build signed instrumentation test APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AL_VERSION_CODE: 124
+  AL_VERSION_NAME: 1.0.124-p0test
+  TZ: Asia/Shanghai
+
+jobs:
+  build-signed-instrumentation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Run JavaScript checks
+        run: npm test
+
+      - name: Restore Firebase Android config
+        env:
+          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON_BASE64" ]; then
+            printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | base64 --decode > android/app/google-services.json
+          fi
+
+      - name: Restore stable Android signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$ANDROID_KEYSTORE_BASE64"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/al-release.p12
+
+      - name: Sync bundled web assets
+        run: |
+          node scripts/generate-yuqi-network-policy.mjs
+          npx cap sync android
+
+      - name: Run signed native checks and build test APKs
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PATH: al-release.p12
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew testDebugUnitTest assembleDebugAndroidTest --no-daemon --no-problems-report --console=plain
+
+      - name: Verify signed test packages
+        working-directory: android
+        run: |
+          BUILD_TOOLS_DIR="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs app/build/outputs/apk/debug/app-debug.apk
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+
+      - name: Upload signed test packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: AL-signed-instrumentation-${{ env.AL_VERSION_NAME }}
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          if-no-files-found: error
+          retention-days: 7

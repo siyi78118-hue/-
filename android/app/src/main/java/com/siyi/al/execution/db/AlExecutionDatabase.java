@@ -28,6 +28,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase;
         LifecycleControlEntity.class,
         LifecycleInboundAckTombstoneEntity.class,
         RoleNotificationCancellationEntity.class,
+        RoleDeleteOperationEntity.class,
         AutomaticScheduleAuthorityEntity.class,
         AutomaticScheduleOutboxEntity.class,
         AutomaticScheduleEventEntity.class
@@ -36,7 +37,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase;
     exportSchema = false
 )
 public abstract class AlExecutionDatabase extends RoomDatabase {
-    public static final int SCHEMA_VERSION = 16;
+    public static final int SCHEMA_VERSION = 17;
     private static volatile AlExecutionDatabase instance;
     private static final Migration MIGRATION_1_2 = new Migration(1, 2) {
         @Override
@@ -247,6 +248,23 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
         }
     };
 
+    public static final Migration MIGRATION_16_17 = new Migration(16, 17) {
+        @Override public void migrate(SupportSQLiteDatabase database) {
+            database.execSQL("CREATE TABLE IF NOT EXISTS `role_delete_operations` ("
+                + "`operationId` TEXT NOT NULL, `control_id` TEXT NOT NULL, `character_id` TEXT NOT NULL, "
+                + "`operationChecksum` TEXT NOT NULL, `state` TEXT NOT NULL, `phase` TEXT NOT NULL, "
+                + "`cursorJson` TEXT NOT NULL, `affectedCount` INTEGER NOT NULL, "
+                + "`sourceSnapshotChecksum` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, "
+                + "`updatedAt` INTEGER NOT NULL, `lastError` TEXT, PRIMARY KEY(`operationId`), "
+                + "CHECK(`state` IN ('prepared','running','completed','failed','unknown')), "
+                + "CHECK(`phase` IN ('prepared','freeze_created','deleting','complete','failed','unknown','legacy_control_recovered'))) ");
+            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_role_delete_operations_control_id` "
+                + "ON `role_delete_operations` (`control_id`)");
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_role_delete_operations_character_id_state_updated_at` "
+                + "ON `role_delete_operations` (`character_id`, `state`, `updatedAt`)");
+        }
+    };
+
     public abstract AlExecutionDao executionDao();
 
     public static AlExecutionDatabase get(Context context) {
@@ -261,7 +279,7 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                         MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
                         MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13,
-                        MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16
+                        MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17
                     ).build();
                 }
             }

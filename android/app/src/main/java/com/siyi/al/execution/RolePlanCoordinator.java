@@ -63,40 +63,7 @@ public final class RolePlanCoordinator {
         RolePlanOccurrenceEntity occurrence = database.executionDao().rolePlanOccurrenceByTurn(turnId);
         if (occurrence == null || "COMPLETED".equals(occurrence.state)) return;
         final Long[] nextAlarm = new Long[] { null };
-        database.runInTransaction(() -> {
-            RolePlanEntity plan = database.executionDao().rolePlan(occurrence.planId);
-            if (plan != null && store.isRoleDeleteTombstoned(plan.characterId)) return;
-            if (plan != null
-                && "active".equals(plan.status)
-                && plan.nextRunAt != null
-                && plan.nextRunAt.longValue() == occurrence.scheduledFor) {
-                try {
-                    RolePlanCompletion.Result advanced = RolePlanCompletion.advance(
-                        new JSONObject(plan.planJson), occurrence.scheduledFor, now
-                    );
-                    plan.status = advanced.status;
-                    plan.nextRunAt = advanced.nextRunAt;
-                    plan.updatedAt = now;
-                    plan.planJson = advanced.planJson.toString();
-                    database.executionDao().upsertRolePlans(Collections.singletonList(plan));
-                    updateSnapshotPlan(plan, advanced.planJson, now);
-                    nextAlarm[0] = advanced.nextRunAt;
-                } catch (Exception error) {
-                    throw new IllegalStateException("ROLE_PLAN_ADVANCE_FAILED", error);
-                }
-            }
-            database.executionDao().completeRolePlanOccurrence(occurrence.occurrenceId, now);
-        });
-        if (context != null && nextAlarm[0] != null) {
-            RolePlanEntity current = database.executionDao().rolePlan(occurrence.planId);
-            if (current != null && store.isRoleDeleteTombstoned(current.characterId)) return;
-            RolePlanAlarmScheduler.schedule(context, occurrence.planId, nextAlarm[0]);
-        }
-    }
-
-    public int reconcileFailedTurns(long now) {
-        int failed = 0;
-        for (RolePlanOccurrenceEntity occurrence : database.executionDao().failedRolePlanOccurrences(50)) {
+        store.runRoleSideEffectIfNotDeleted(occurrence.characterId, () -> {
             database.runInTransaction(() -> {
                 RolePlanEntity plan = database.executionDao().rolePlan(occurrence.planId);
                 if (plan != null && store.isRoleDeleteTombstoned(plan.characterId)) return;
@@ -105,29 +72,70 @@ public final class RolePlanCoordinator {
                     && plan.nextRunAt != null
                     && plan.nextRunAt.longValue() == occurrence.scheduledFor) {
                     try {
-                        RolePlanCompletion.Result marked = RolePlanCompletion.fail(
-                            new JSONObject(plan.planJson), occurrence.scheduledFor, now, "TURN_FAILED_FINAL"
+                        RolePlanCompletion.Result advanced = RolePlanCompletion.advance(
+                            new JSONObject(plan.planJson), occurrence.scheduledFor, now
                         );
-                        plan.status = marked.status;
-                        plan.nextRunAt = marked.nextRunAt;
+                        plan.status = advanced.status;
+                        plan.nextRunAt = advanced.nextRunAt;
                         plan.updatedAt = now;
-                        plan.planJson = marked.planJson.toString();
+                        plan.planJson = advanced.planJson.toString();
                         database.executionDao().upsertRolePlans(Collections.singletonList(plan));
-                        updateSnapshotPlan(plan, marked.planJson, now);
+                        updateSnapshotPlan(plan, advanced.planJson, now);
+                        nextAlarm[0] = advanced.nextRunAt;
                     } catch (Exception error) {
-                        throw new IllegalStateException("ROLE_PLAN_FAILURE_RECONCILE_FAILED", error);
+                        throw new IllegalStateException("ROLE_PLAN_ADVANCE_FAILED", error);
                     }
                 }
-                database.executionDao().failRolePlanOccurrence(
-                    occurrence.occurrenceId, "TURN_FAILED_FINAL", now
-                );
+                database.executionDao().completeRolePlanOccurrence(occurrence.occurrenceId, now);
             });
-            failed += 1;
+            if (context != null && nextAlarm[0] != null) {
+                RolePlanAlarmScheduler.schedule(context, occurrence.planId, nextAlarm[0]);
+            }
+        });
+    }
+
+    public int reconcileFailedTurns(long now) {
+        int failed = 0;
+        for (RolePlanOccurrenceEntity occurrence : database.executionDao().failedRolePlanOccurrences(50)) {
+            final boolean[] reconciled = {false};
+            boolean gateCompleted = store.runRoleSideEffectIfNotDeleted(
+                occurrence.characterId,
+                () -> {
+                    database.runInTransaction(() -> {
+                        RolePlanEntity plan = database.executionDao().rolePlan(occurrence.planId);
+                        if (plan != null && store.isRoleDeleteTombstoned(plan.characterId)) return;
+                        if (plan != null
+                            && "active".equals(plan.status)
+                            && plan.nextRunAt != null
+                            && plan.nextRunAt.longValue() == occurrence.scheduledFor) {
+                            try {
+                                RolePlanCompletion.Result marked = RolePlanCompletion.fail(
+                                    new JSONObject(plan.planJson), occurrence.scheduledFor, now, "TURN_FAILED_FINAL"
+                                );
+                                plan.status = marked.status;
+                                plan.nextRunAt = marked.nextRunAt;
+                                plan.updatedAt = now;
+                                plan.planJson = marked.planJson.toString();
+                                database.executionDao().upsertRolePlans(Collections.singletonList(plan));
+                                updateSnapshotPlan(plan, marked.planJson, now);
+                            } catch (Exception error) {
+                                throw new IllegalStateException("ROLE_PLAN_FAILURE_RECONCILE_FAILED", error);
+                            }
+                        }
+                        database.executionDao().failRolePlanOccurrence(
+                            occurrence.occurrenceId, "TURN_FAILED_FINAL", now
+                        );
+                        reconciled[0] = true;
+                    });
+                }
+            );
+            if (gateCompleted && reconciled[0]) failed += 1;
         }
         return failed;
     }
 
     private void updateSnapshotPlan(RolePlanEntity plan, JSONObject planJson, long now) throws Exception {
+        store.assertRoleAcceptsSemanticWrite(plan.characterId);
         String snapshotId = plan.characterId + ":role-plan:" + plan.planId;
         CharacterSnapshotEntity snapshot = database.executionDao().latestSnapshot(snapshotId);
         if (snapshot == null || snapshot.contextJson == null || snapshot.contextJson.trim().isEmpty()) return;
