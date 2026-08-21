@@ -3253,7 +3253,14 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 encoded, safeCharacterId, peerId, requestedAt
             );
             if (dao.insertLifecycleControl(row) != 1L) {
-                throw new IllegalStateException("conversation clear already exists");
+                LifecycleControlEntity byId = dao.lifecycleControl(row.controlId);
+                LifecycleControlEntity byEpoch = row.clearEpoch == null ? null
+                    : dao.lifecycleControlForClear(safeCharacterId, row.clearEpoch);
+                throw new IllegalStateException(
+                    "conversation clear already exists controlId=" + row.controlId
+                        + " clearEpoch=" + row.clearEpoch
+                        + " byId=" + (byId == null ? "none" : byId.controlId)
+                        + " byEpoch=" + (byEpoch == null ? "none" : byEpoch.controlId));
             }
             terminalFaultHook.after("lifecycle_control");
             dao.clearReplyPartsThroughSequence(safeCharacterId, clearedThroughSequence);

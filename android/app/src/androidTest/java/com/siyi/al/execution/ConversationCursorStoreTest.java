@@ -354,14 +354,7 @@ public class ConversationCursorStoreTest {
         AlExecutionDatabase.MIGRATION_13_14.migrate(db);
         AlExecutionDatabase.MIGRATION_14_15.migrate(db);
         String contextJson = "[{\"speaker\":\"用户\",\"text\":\"旧聊天必须原样保留\"}]";
-        db.execSQL("CREATE TABLE `character_snapshots` ("
-            + "`snapshotId` TEXT NOT NULL, `characterId` TEXT NOT NULL, `characterName` TEXT NOT NULL, "
-            + "`playerName` TEXT NOT NULL, `systemPrompt` TEXT NOT NULL, `momentSystemPrompt` TEXT NOT NULL, "
-            + "`contextJson` TEXT NOT NULL, `chatConfigId` TEXT NOT NULL, `memoryConfigId` TEXT NOT NULL, "
-            + "`createdAt` INTEGER NOT NULL, `scheduledFor` INTEGER, `automaticKind` TEXT, `cloudJobId` TEXT, "
-            + "`automaticTasksEnabled` INTEGER NOT NULL, `jobSnapshot` INTEGER NOT NULL, PRIMARY KEY(`snapshotId`))");
-        db.execSQL("CREATE INDEX `index_character_snapshots_characterId_createdAt` ON `character_snapshots` (`characterId`, `createdAt`)");
-        db.execSQL("CREATE INDEX `index_character_snapshots_cloudJobId_scheduledFor` ON `character_snapshots` (`cloudJobId`, `scheduledFor`)");
+        assertTrue(hasTable(db, "character_snapshots"));
         db.execSQL("INSERT INTO character_snapshots (snapshotId, characterId, characterName, playerName, "
             + "systemPrompt, momentSystemPrompt, contextJson, chatConfigId, memoryConfigId, createdAt, "
             + "scheduledFor, automaticKind, cloudJobId, automaticTasksEnabled, jobSnapshot) VALUES "
@@ -864,6 +857,43 @@ public class ConversationCursorStoreTest {
             + "`cursor` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `turnId` TEXT, `type` TEXT NOT NULL, "
             + "`payloadJson` TEXT NOT NULL, `createdAt` INTEGER NOT NULL)");
         db.execSQL("CREATE INDEX `index_change_events_turnId_cursor` ON `change_events` (`turnId`, `cursor`)");
+        db.execSQL("CREATE TABLE `role_plans` ("
+            + "`planId` TEXT NOT NULL, `characterId` TEXT NOT NULL, `status` TEXT NOT NULL, "
+            + "`planJson` TEXT NOT NULL, `nextRunAt` INTEGER, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`planId`))");
+        db.execSQL("CREATE INDEX `index_role_plans_characterId_status_nextRunAt` ON `role_plans` (`characterId`, `status`, `nextRunAt`)");
+        db.execSQL("CREATE TABLE `role_plan_history` ("
+            + "`historyId` TEXT NOT NULL, `planId` TEXT NOT NULL, `historyJson` TEXT NOT NULL, "
+            + "`createdAt` INTEGER NOT NULL, PRIMARY KEY(`historyId`))");
+        db.execSQL("CREATE INDEX `index_role_plan_history_planId_createdAt` ON `role_plan_history` (`planId`, `createdAt`)");
+        db.execSQL("CREATE TABLE `role_plan_occurrences` ("
+            + "`occurrenceId` TEXT NOT NULL, `planId` TEXT NOT NULL, `characterId` TEXT NOT NULL, "
+            + "`state` TEXT NOT NULL, `turnId` TEXT NOT NULL, `jobId` TEXT NOT NULL, `errorCode` TEXT NOT NULL, "
+            + "`scheduledFor` INTEGER NOT NULL, `claimedAt` INTEGER, `completedAt` INTEGER, `updatedAt` INTEGER NOT NULL, "
+            + "PRIMARY KEY(`occurrenceId`))");
+        db.execSQL("CREATE INDEX `index_role_plan_occurrences_planId` ON `role_plan_occurrences` (`planId`)");
+        db.execSQL("CREATE UNIQUE INDEX `index_role_plan_occurrences_turnId` ON `role_plan_occurrences` (`turnId`)");
+        db.execSQL("CREATE TABLE `yuqi_raw_messages` ("
+            + "`messageId` TEXT NOT NULL, `turnId` TEXT NOT NULL, `characterId` TEXT NOT NULL, `speakerId` TEXT NOT NULL, "
+            + "`speakerType` TEXT NOT NULL, `recipientId` TEXT NOT NULL, `content` TEXT NOT NULL, `sentAt` INTEGER NOT NULL, "
+            + "`origin` TEXT NOT NULL, `deviceId` TEXT NOT NULL, `deviceSeq` INTEGER NOT NULL, `checksum` TEXT NOT NULL, "
+            + "`syncSeq` INTEGER NOT NULL, PRIMARY KEY(`messageId`))");
+        db.execSQL("CREATE INDEX `index_yuqi_raw_messages_characterId_sentAt` ON `yuqi_raw_messages` (`characterId`, `sentAt`)");
+        db.execSQL("CREATE INDEX `index_yuqi_raw_messages_turnId` ON `yuqi_raw_messages` (`turnId`)");
+        db.execSQL("CREATE UNIQUE INDEX `index_yuqi_raw_messages_deviceId_deviceSeq` ON `yuqi_raw_messages` (`deviceId`, `deviceSeq`)");
+        db.execSQL("CREATE TABLE `yuqi_evidence_facts` ("
+            + "`factId` TEXT NOT NULL, `characterId` TEXT NOT NULL, `subjectId` TEXT NOT NULL, `predicate` TEXT NOT NULL, "
+            + "`objectJson` TEXT NOT NULL, `evidenceMode` TEXT NOT NULL, `sourceMessageIdsJson` TEXT NOT NULL, "
+            + "`exactQuotesJson` TEXT NOT NULL, `status` TEXT NOT NULL, `confidence` REAL NOT NULL, `origin` TEXT NOT NULL, "
+            + "`checksum` TEXT NOT NULL, `updatedAt` INTEGER NOT NULL, `syncSeq` INTEGER NOT NULL, PRIMARY KEY(`factId`))");
+        db.execSQL("CREATE INDEX `index_yuqi_evidence_facts_characterId_status` ON `yuqi_evidence_facts` (`characterId`, `status`)");
+        db.execSQL("CREATE INDEX `index_yuqi_evidence_facts_subjectId_predicate` ON `yuqi_evidence_facts` (`subjectId`, `predicate`)");
+        db.execSQL("CREATE TABLE `yuqi_sync_cursors` (`peerId` TEXT NOT NULL, `ackSeq` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`peerId`))");
+        db.execSQL("CREATE TABLE `yuqi_annotations` ("
+            + "`annotationId` TEXT NOT NULL, `turnId` TEXT NOT NULL, `sourceMessageId` TEXT, `presetVersion` TEXT NOT NULL, "
+            + "`userCorrection` TEXT NOT NULL, `desiredBehavior` TEXT NOT NULL, `status` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, "
+            + "`syncSeq` INTEGER NOT NULL, `checksum` TEXT NOT NULL, PRIMARY KEY(`annotationId`))");
+        db.execSQL("CREATE INDEX `index_yuqi_annotations_status_createdAt` ON `yuqi_annotations` (`status`, `createdAt`)");
+        db.execSQL("CREATE INDEX `index_yuqi_annotations_turnId` ON `yuqi_annotations` (`turnId`)");
     }
 
     private static void insertPopulatedV11History(SupportSQLiteDatabase db) {
