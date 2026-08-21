@@ -119,6 +119,27 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
     };
     public static final Migration MIGRATION_10_11 = new Migration(10, 11) {
         @Override public void migrate(SupportSQLiteDatabase database) {
+            // Historical v10 installations do not all carry Room's current
+            // foreign-key/index contract. Rebuild the table in the migration
+            // itself so reopen validation does not depend on the old DDL or a
+            // test fixture.
+            database.execSQL("CREATE TABLE `execution_attempts_v11` ("
+                + "`attemptId` TEXT NOT NULL, `turnId` TEXT NOT NULL, `sequence` INTEGER NOT NULL, "
+                + "`stage` TEXT NOT NULL, `state` TEXT NOT NULL, `startedAt` INTEGER NOT NULL, "
+                + "`heartbeatAt` INTEGER NOT NULL, `finishedAt` INTEGER, `memoryResult` TEXT, `rawReply` TEXT, "
+                + "`errorCode` TEXT, `errorDetail` TEXT, `retryable` INTEGER NOT NULL, `crashCount` INTEGER NOT NULL, "
+                + "PRIMARY KEY(`attemptId`), FOREIGN KEY(`turnId`) REFERENCES `chat_turns`(`turnId`) ON DELETE CASCADE)");
+            database.execSQL("INSERT INTO `execution_attempts_v11` ("
+                + "`attemptId`, `turnId`, `sequence`, `stage`, `state`, `startedAt`, `heartbeatAt`, "
+                + "`finishedAt`, `memoryResult`, `rawReply`, `errorCode`, `errorDetail`, `retryable`, `crashCount`) "
+                + "SELECT `attemptId`, `turnId`, `sequence`, `stage`, `state`, `startedAt`, `heartbeatAt`, "
+                + "`finishedAt`, `memoryResult`, `rawReply`, `errorCode`, `errorDetail`, `retryable`, `crashCount` "
+                + "FROM `execution_attempts`");
+            database.execSQL("DROP TABLE `execution_attempts`");
+            database.execSQL("ALTER TABLE `execution_attempts_v11` RENAME TO `execution_attempts`");
+            database.execSQL("CREATE INDEX `index_execution_attempts_turnId` ON `execution_attempts` (`turnId`)");
+            database.execSQL("CREATE UNIQUE INDEX `index_execution_attempts_turnId_sequence` ON `execution_attempts` (`turnId`, `sequence`)");
+            database.execSQL("CREATE INDEX `index_execution_attempts_stage_heartbeatAt` ON `execution_attempts` (`stage`, `heartbeatAt`)");
             database.execSQL("CREATE TABLE IF NOT EXISTS `conversation_cursors` ("
                 + "`characterId` TEXT NOT NULL, `nativeCompletedTurnId` TEXT, "
                 + "`nativeCompletedGroupId` TEXT, `nativeCompletedSequence` INTEGER NOT NULL, "

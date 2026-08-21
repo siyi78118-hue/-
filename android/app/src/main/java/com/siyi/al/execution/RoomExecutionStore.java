@@ -3088,8 +3088,15 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 // new clear epoch; only a pending/replayed control should return
                 // the existing operation.
                 boolean resumePostClear = expectedCursorChecksum.equals(currentCursorChecksum);
+                boolean peerMatches = peerId.equals(existing.peerId);
+                // A completed control is historical evidence, not a permanent
+                // device identity lock. A new peer may open the next epoch
+                // only with the post-clear cursor proof; pending/replayed
+                // controls still require the original peer.
+                boolean peerAllowed = peerMatches
+                    || (LifecycleControl.APPLIED.equals(existing.state) && resumePostClear);
                 if ((!replayPreClear && !resumePostClear)
-                    || !peerId.equals(existing.peerId) || !semanticExact) {
+                    || !peerAllowed || !semanticExact) {
                     throw new IllegalStateException("conversation clear identity conflict");
                 }
                 if (replayPreClear || !LifecycleControl.APPLIED.equals(existing.state)) {

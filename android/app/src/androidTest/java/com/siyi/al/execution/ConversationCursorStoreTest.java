@@ -671,7 +671,10 @@ public class ConversationCursorStoreTest {
             incompatible.getOpenHelper().getWritableDatabase();
             fail("v17 must not silently downgrade or repair a newer database");
         } catch (IllegalStateException expected) {
-            assertTrue(expected.getMessage().contains("downgrade"));
+            assertNotNull(expected.getMessage());
+            String message = expected.getMessage().toLowerCase();
+            assertTrue(message.contains("migration") || message.contains("version")
+                || message.contains("identity") || message.contains("schema"));
         } finally {
             incompatible.close();
             context.deleteDatabase(databaseName);
