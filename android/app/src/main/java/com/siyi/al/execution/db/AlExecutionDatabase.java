@@ -135,7 +135,7 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                 + "`commitPayloadVersion` TEXT, `authorityOrigin` TEXT, "
                 + "`terminalDisposition` TEXT, `updatedAt` INTEGER NOT NULL, "
                 + "PRIMARY KEY(`authorityLineageKey`))");
-            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS "
+            database.execSQL("CREATE UNIQUE INDEX "
                 + "`index_conversation_authorities_characterId_laneKey_rootSourceId` "
                 + "ON `conversation_authorities` (`characterId`, `laneKey`, `rootSourceId`)");
             database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `visibleGroupId` TEXT");
@@ -152,6 +152,14 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
             database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `inputClearEpoch` INTEGER");
             database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `bridgeCommitChecksum` TEXT");
             database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `terminalDisposition` TEXT");
+            // Room validates entity indices after every upgrade. Older v10 databases
+            // may have been created without the current ChatTurn indices, so make
+            // the canonical index set explicit as part of the first authority
+            // migration. IF NOT EXISTS keeps this safe for databases that already
+            // carried one or more of these indices.
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_chat_turns_sourceMessageId` ON `chat_turns` (`sourceMessageId`)");
+            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_chat_turns_cloudJobId` ON `chat_turns` (`cloudJobId`)");
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_chat_turns_state_createdAt` ON `chat_turns` (`state`, `createdAt`)");
         }
     };
     public static final Migration MIGRATION_11_12 = new Migration(11, 12) {
@@ -171,7 +179,7 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                 + "`leaseAttempt` INTEGER NOT NULL DEFAULT 0, `leasedAt` INTEGER, `relayMessageId` TEXT, "
                 + "`appliedAt` INTEGER, `relayExpiresAt` INTEGER, `updatedAt` INTEGER NOT NULL, "
                 + "PRIMARY KEY(`controlId`))");
-            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_lifecycle_controls_characterId_clearEpoch` "
+            database.execSQL("CREATE UNIQUE INDEX `index_lifecycle_controls_characterId_clearEpoch` "
                 + "ON `lifecycle_controls` (`characterId`, `clearEpoch`)");
         }
     };
@@ -183,7 +191,7 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                 + "`controlId` TEXT NOT NULL, `controlChecksum` TEXT NOT NULL, "
                 + "`ackChecksum` TEXT NOT NULL, `reasonCode` TEXT NOT NULL, "
                 + "`createdAt` INTEGER NOT NULL, PRIMARY KEY(`ackKey`))");
-            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS "
+            database.execSQL("CREATE UNIQUE INDEX "
                 + "`index_lifecycle_inbound_ack_tombstones_peerId_inboundRelayMessageId` "
                 + "ON `lifecycle_inbound_ack_tombstones` (`peerId`, `inboundRelayMessageId`)");
         }

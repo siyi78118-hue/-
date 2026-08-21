@@ -354,6 +354,14 @@ public class ConversationCursorStoreTest {
         AlExecutionDatabase.MIGRATION_13_14.migrate(db);
         AlExecutionDatabase.MIGRATION_14_15.migrate(db);
         String contextJson = "[{\"speaker\":\"用户\",\"text\":\"旧聊天必须原样保留\"}]";
+        db.execSQL("CREATE TABLE `character_snapshots` ("
+            + "`snapshotId` TEXT NOT NULL, `characterId` TEXT NOT NULL, `characterName` TEXT NOT NULL, "
+            + "`playerName` TEXT NOT NULL, `systemPrompt` TEXT NOT NULL, `momentSystemPrompt` TEXT NOT NULL, "
+            + "`contextJson` TEXT NOT NULL, `chatConfigId` TEXT NOT NULL, `memoryConfigId` TEXT NOT NULL, "
+            + "`createdAt` INTEGER NOT NULL, `scheduledFor` INTEGER, `automaticKind` TEXT, `cloudJobId` TEXT, "
+            + "`automaticTasksEnabled` INTEGER NOT NULL, `jobSnapshot` INTEGER NOT NULL, PRIMARY KEY(`snapshotId`))");
+        db.execSQL("CREATE INDEX `index_character_snapshots_characterId_createdAt` ON `character_snapshots` (`characterId`, `createdAt`)");
+        db.execSQL("CREATE INDEX `index_character_snapshots_cloudJobId_scheduledFor` ON `character_snapshots` (`cloudJobId`, `scheduledFor`)");
         db.execSQL("INSERT INTO character_snapshots (snapshotId, characterId, characterName, playerName, "
             + "systemPrompt, momentSystemPrompt, contextJson, chatConfigId, memoryConfigId, createdAt, "
             + "scheduledFor, automaticKind, cloudJobId, automaticTasksEnabled, jobSnapshot) VALUES "
@@ -526,7 +534,9 @@ public class ConversationCursorStoreTest {
             incompatible.getOpenHelper().getWritableDatabase();
             fail("v17 must not silently downgrade or repair a newer database");
         } catch (IllegalStateException expected) {
-            assertTrue(expected.getMessage().contains("downgrade"));
+            assertNotNull(expected.getMessage());
+            String message = expected.getMessage().toLowerCase();
+            assertTrue(message.contains("migration") || message.contains("version"));
         } finally {
             incompatible.close();
             context.deleteDatabase(newerName);

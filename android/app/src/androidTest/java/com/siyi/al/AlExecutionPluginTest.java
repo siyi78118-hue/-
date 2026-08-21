@@ -41,7 +41,7 @@ public class AlExecutionPluginTest {
             assertEquals("device-after-save", first.peerId);
 
             database.getOpenHelper().getWritableDatabase().execSQL(
-                "UPDATE lifecycle_controls SET state='APPLIED', appliedAt=?, updatedAt=? WHERE controlId=?",
+                "UPDATE lifecycle_controls SET state='applied', appliedAt=?, updatedAt=? WHERE controlId=?",
                 new Object[]{first.requestedAt, first.requestedAt, first.controlId});
             ConversationCursorEntity after = savedPeer.getConversationCursor("yuqi");
             RoomExecutionStore changedPeer = AlExecutionPlugin.storeForBridgeConfig(
