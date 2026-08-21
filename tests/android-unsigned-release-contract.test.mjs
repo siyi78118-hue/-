@@ -38,7 +38,7 @@ test('the signed branch build publishes an OTA manifest that names the real rele
   );
   assert.match(
     androidWorkflow,
-    /if:\s*github\.ref == 'refs\/heads\/main' \|\| github\.ref == 'refs\/heads\/codex\/al-tdd'/
+    /if:\s*\(github\.ref == 'refs\/heads\/main' \|\| github\.ref == 'refs\/heads\/codex\/al-tdd'\) && inputs\.mode != 'signed-instrumentation'/
   );
   assert.match(androidWorkflow, /releases\/download\/android-v%s\/app-release\.apk/);
 });

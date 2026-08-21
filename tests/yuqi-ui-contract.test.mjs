@@ -368,7 +368,7 @@ test('Room persists fresh retry turns and only deduplicates an exact turn id', (
   assert.doesNotMatch(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}, unique = true\)/);
   assert.match(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}\)/);
   assert.match(executionDatabase, /version\s*=\s*AlExecutionDatabase\.SCHEMA_VERSION/);
-  assert.match(executionDatabase, /SCHEMA_VERSION\s*=\s*16/);
+  assert.match(executionDatabase, /SCHEMA_VERSION\s*=\s*17/);
   assert.match(executionDatabase, /new Migration\(8,\s*9\)/);
   assert.match(executionDatabase, /MIGRATION_10_11/);
   assert.match(executionDatabase, /MIGRATION_11_12/);
@@ -376,6 +376,7 @@ test('Room persists fresh retry turns and only deduplicates an exact turn id', (
   assert.match(executionDatabase, /MIGRATION_13_14/);
   assert.match(executionDatabase, /MIGRATION_14_15/);
   assert.match(executionDatabase, /MIGRATION_15_16/);
+  assert.match(executionDatabase, /MIGRATION_16_17/);
   assert.match(executionDatabase, /MIGRATION_9_10,\s*MIGRATION_10_11,\s*MIGRATION_11_12,\s*MIGRATION_12_13,[\s\S]*MIGRATION_13_14/);
   assert.match(executionDatabase, /DROP INDEX IF EXISTS `index_chat_turns_sourceMessageId`/);
   assert.match(executionDatabase, /CREATE INDEX IF NOT EXISTS `index_chat_turns_sourceMessageId`/);
@@ -1004,7 +1005,7 @@ test('native inbox flushes the coalesced durable app_state mirror before acknowl
 
 test('native delivery diagnostics persist and expose four independent convergence stages', () => {
   assert.match(executionDatabase, /version\s*=\s*AlExecutionDatabase\.SCHEMA_VERSION/);
-  assert.match(executionDatabase, /SCHEMA_VERSION\s*=\s*16/);
+  assert.match(executionDatabase, /SCHEMA_VERSION\s*=\s*17/);
   assert.match(executionDatabase, /MIGRATION_9_10/);
   assert.match(executionDatabase, /MIGRATION_10_11/);
   assert.match(executionDatabase, /MIGRATION_11_12/);
@@ -1012,6 +1013,7 @@ test('native delivery diagnostics persist and expose four independent convergenc
   assert.match(executionDatabase, /MIGRATION_13_14/);
   assert.match(executionDatabase, /MIGRATION_14_15/);
   assert.match(executionDatabase, /MIGRATION_15_16/);
+  assert.match(executionDatabase, /MIGRATION_16_17/);
   assert.match(chatTurnEntity, /Long\s+notificationShownAt/);
   assert.match(chatTurnEntity, /Long\s+cloudConfirmedAt/);
   assert.match(executionDao, /markNotificationShown/);
