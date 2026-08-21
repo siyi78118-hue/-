@@ -9,6 +9,15 @@ env:
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Build mode for manual runs'
+        required: false
+        default: release
+        type: choice
+        options:
+          - release
+          - signed-instrumentation
   push:
     branches:
       - main
@@ -79,6 +88,11 @@ jobs:
 
       - name: Run native Android checks
         working-directory: android
+        env:
+          ANDROID_KEYSTORE_PATH: al-release.p12
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set +e
           set -o pipefail
@@ -91,6 +105,7 @@ jobs:
           exit "$status"
 
       - name: Build release and compatibility APKs
+        if: inputs.mode != 'signed-instrumentation'
         working-directory: android
         env:
           AL_VERSION_CODE: ${{ env.AL_RELEASE_VERSION_CODE }}
@@ -102,6 +117,7 @@ jobs:
         run: ./gradlew assembleRelease assembleDebug --no-daemon
 
       - name: Verify APK signatures
+        if: inputs.mode != 'signed-instrumentation'
         working-directory: android
         run: |
           BUILD_TOOLS_DIR="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
@@ -109,6 +125,7 @@ jobs:
           "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs app/build/outputs/apk/debug/app-debug.apk
 
       - name: Upload APK
+        if: inputs.mode != 'signed-instrumentation'
         uses: actions/upload-artifact@v4
         with:
           name: AL-android-installers
@@ -118,8 +135,26 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Verify signed instrumentation packages
+        if: inputs.mode == 'signed-instrumentation'
+        working-directory: android
+        run: |
+          BUILD_TOOLS_DIR="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs app/build/outputs/apk/debug/app-debug.apk
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+
+      - name: Upload signed instrumentation packages
+        if: inputs.mode == 'signed-instrumentation'
+        uses: actions/upload-artifact@v4
+        with:
+          name: AL-signed-instrumentation-${{ env.AL_RELEASE_VERSION_NAME }}
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+          if-no-files-found: error
+          retention-days: 7
       - name: Publish branch-signed APK handoff
-        if: github.ref == 'refs/heads/codex/al-tdd'
+        if: github.ref == 'refs/heads/codex/al-tdd' && inputs.mode != 'signed-instrumentation'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -149,7 +184,7 @@ jobs:
           gh api --method PUT "repos/${{ github.repository }}/contents/$TARGET_PATH" --input /tmp/al-release.json
 
       - name: Publish Android update
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/al-tdd'
+        if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/al-tdd') && inputs.mode != 'signed-instrumentation'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -169,7 +204,7 @@ jobs:
           fi
 
       - name: Publish automatic update manifest
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/al-tdd'
+        if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/al-tdd') && inputs.mode != 'signed-instrumentation'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
