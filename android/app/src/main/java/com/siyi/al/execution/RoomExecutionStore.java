@@ -3252,15 +3252,8 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             LifecycleControlEntity row = encodedToEntity(
                 encoded, safeCharacterId, peerId, requestedAt
             );
-            if (dao.insertLifecycleControl(row) != 1L) {
-                LifecycleControlEntity byId = dao.lifecycleControl(row.controlId);
-                LifecycleControlEntity byEpoch = row.clearEpoch == null ? null
-                    : dao.lifecycleControlForClear(safeCharacterId, row.clearEpoch);
-                throw new IllegalStateException(
-                    "conversation clear already exists controlId=" + row.controlId
-                        + " clearEpoch=" + row.clearEpoch
-                        + " byId=" + (byId == null ? "none" : byId.controlId)
-                        + " byEpoch=" + (byEpoch == null ? "none" : byEpoch.controlId));
+            if (dao.insertLifecycleControl(row) <= 0L) {
+                throw new IllegalStateException("conversation clear already exists");
             }
             terminalFaultHook.after("lifecycle_control");
             dao.clearReplyPartsThroughSequence(safeCharacterId, clearedThroughSequence);
@@ -3703,7 +3696,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                     ? null : "LEGACY_CONTROL_OPERATION_UNKNOWN";
                 migrated.createdAt = existing.requestedAt;
                 migrated.updatedAt = Math.max(existing.updatedAt, requestedAt);
-                if (dao.insertRoleDeleteOperation(migrated) != 1L) {
+                if (dao.insertRoleDeleteOperation(migrated) <= 0L) {
                     throw new IllegalStateException("role delete operation migration conflict");
                 }
                 shouldExecute[0] = false;
@@ -3738,8 +3731,8 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             operation.sourceSnapshotChecksum = backupReceipt.optString("logicalChecksum", "");
             operation.createdAt = requestedAt;
             operation.updatedAt = requestedAt;
-            if (dao.insertLifecycleControl(control) != 1L
-                || dao.insertRoleDeleteOperation(operation) != 1L) {
+            if (dao.insertLifecycleControl(control) <= 0L
+                || dao.insertRoleDeleteOperation(operation) <= 0L) {
                 throw new IllegalStateException("role delete operation prepare conflict");
             }
             shouldExecute[0] = true;
@@ -4022,7 +4015,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             LifecycleControlEntity row = encodedToRoleDeleteEntity(
                 encoded, safeCharacterId, peerId, requestedAt);
             List<String> roleTurnIds = dao.turnIdsForCharacter(safeCharacterId);
-            if (dao.insertLifecycleControl(row) != 1L) {
+            if (dao.insertLifecycleControl(row) <= 0L) {
                 throw new IllegalStateException("role delete already exists");
             }
             // Disable existing chat/moment schedules before semantic role rows

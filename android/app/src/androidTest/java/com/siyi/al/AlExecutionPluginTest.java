@@ -46,25 +46,8 @@ public class AlExecutionPluginTest {
             ConversationCursorEntity after = savedPeer.getConversationCursor("yuqi");
             RoomExecutionStore changedPeer = AlExecutionPlugin.storeForBridgeConfig(
                 database, bridgeConfig("device-after-rotation"));
-            LifecycleControl second;
-            try {
-                second = changedPeer.createConversationClear(
-                    "yuqi", RoomExecutionStore.conversationCursorChecksum("yuqi", after));
-            } catch (RuntimeException error) {
-                StringBuilder rows = new StringBuilder(error.getMessage());
-                rows.append(" maxEpoch=")
-                    .append(database.executionDao().maxConversationClearEpoch("yuqi"))
-                    .append(" rows=");
-                for (LifecycleControlEntity row : database.executionDao().lifecycleControls()) {
-                    rows.append("[").append(row.controlId)
-                        .append(",kind=").append(row.controlKind)
-                        .append(",epoch=").append(row.clearEpoch)
-                        .append(",peer=").append(row.peerId)
-                        .append(",state=").append(row.state)
-                        .append("]");
-                }
-                throw new AssertionError(rows.toString(), error);
-            }
+            LifecycleControl second = changedPeer.createConversationClear(
+                "yuqi", RoomExecutionStore.conversationCursorChecksum("yuqi", after));
             assertEquals("device-after-rotation",
                 database.executionDao().lifecycleControl(second.controlId).peerId);
         } finally {
