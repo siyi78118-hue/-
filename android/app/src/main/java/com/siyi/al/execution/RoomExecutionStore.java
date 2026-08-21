@@ -3083,8 +3083,11 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                     semanticExact = false;
                 }
                 boolean replayPreClear = expectedCursorChecksum.equals(semanticInputChecksum);
-                boolean resumePostClear = expectedCursorChecksum.equals(currentCursorChecksum)
-                    && !LifecycleControl.APPLIED.equals(existing.state);
+                // An applied clear is not a permanent identity lock.  Once the
+                // cursor reflects that clear, the same cursor proof authorizes a
+                // new clear epoch; only a pending/replayed control should return
+                // the existing operation.
+                boolean resumePostClear = expectedCursorChecksum.equals(currentCursorChecksum);
                 if ((!replayPreClear && !resumePostClear)
                     || !peerId.equals(existing.peerId) || !semanticExact) {
                     throw new IllegalStateException("conversation clear identity conflict");

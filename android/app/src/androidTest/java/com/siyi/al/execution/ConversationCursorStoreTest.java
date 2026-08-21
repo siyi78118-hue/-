@@ -829,7 +829,10 @@ public class ConversationCursorStoreTest {
             + "`stage` TEXT NOT NULL, `state` TEXT NOT NULL, `startedAt` INTEGER NOT NULL, "
             + "`heartbeatAt` INTEGER NOT NULL, `finishedAt` INTEGER, `memoryResult` TEXT, `rawReply` TEXT, "
             + "`errorCode` TEXT, `errorDetail` TEXT, `retryable` INTEGER NOT NULL, `crashCount` INTEGER NOT NULL, "
-            + "PRIMARY KEY(`attemptId`))");
+            + "PRIMARY KEY(`attemptId`), FOREIGN KEY(`turnId`) REFERENCES `chat_turns`(`turnId`) ON DELETE CASCADE)");
+        db.execSQL("CREATE INDEX `index_execution_attempts_turnId` ON `execution_attempts` (`turnId`)");
+        db.execSQL("CREATE UNIQUE INDEX `index_execution_attempts_turnId_sequence` ON `execution_attempts` (`turnId`, `sequence`)");
+        db.execSQL("CREATE INDEX `index_execution_attempts_stage_heartbeatAt` ON `execution_attempts` (`stage`, `heartbeatAt`)");
     }
 
     private static void insertPopulatedV11History(SupportSQLiteDatabase db) {
