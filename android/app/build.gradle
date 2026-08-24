@@ -30,6 +30,8 @@ android {
     }
     buildTypes {
         debug {
+            applicationIdSuffix ".isolated"
+            versionNameSuffix "-isolated"
             if (System.getenv("ANDROID_KEYSTORE_PATH")) {
                 signingConfig signingConfigs.release
             }

@@ -46,7 +46,7 @@ import androidx.room.Room;
 public final class YuqiV3ConnectedRaceTest {
     @Test public void native_completed_before_ui_open() throws Exception {
             Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.open(context)) {
+        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.openIsolatedApplication(context)) {
             final String logicalId = "connected-native-completed-before-ui-open";
             final String sourceMessageId = fixture.sourceMessageIdForCase(logicalId);
             ConversationCursorEntity initialCursor = fixture.store.getConversationCursor("yuqi");
@@ -164,7 +164,7 @@ public final class YuqiV3ConnectedRaceTest {
     }
     @Test public void ui_open_before_notification() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.open(context);
+        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.openIsolatedApplication(context);
              YuqiV3WebViewHarness web = YuqiV3WebViewHarness.launch()) {
             fixture.enableNotificationsForCase();
             String logicalId = "ui-open-before-notification";
@@ -241,7 +241,7 @@ public final class YuqiV3ConnectedRaceTest {
 
     @Test public void event_and_poll_same_group() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.open(context)) {
+        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.openIsolatedApplication(context)) {
             fixture.enableNotificationsForCase();
             String logicalId = "event-and-poll-same-group";
             String source = fixture.sourceMessageIdForCase(logicalId);
@@ -289,7 +289,7 @@ public final class YuqiV3ConnectedRaceTest {
 
     @Test public void event_lost_poll_recovers() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.open(context)) {
+        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.openIsolatedApplication(context)) {
             String logicalId = "event-lost-poll-recovers";
             String source = fixture.sourceMessageIdForCase(logicalId);
             try (YuqiV3WebViewHarness sourceWeb = YuqiV3WebViewHarness.launch()) {
@@ -317,7 +317,7 @@ public final class YuqiV3ConnectedRaceTest {
 
     @Test public void plugin_promise_hangs_then_replay() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.open(context)) {
+        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.openIsolatedApplication(context)) {
             String logicalId = "plugin-promise-hangs-then-replay";
             String source = fixture.sourceMessageIdForCase(logicalId);
             YuqiV3ConnectedRaceFixture.CanonicalSeed seed;
@@ -377,7 +377,7 @@ public final class YuqiV3ConnectedRaceTest {
 
     @Test public void page_reload_before_ui_ack() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.open(context)) {
+        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.openIsolatedApplication(context)) {
             String logicalId = "page-reload-before-ui-ack";
             String source = fixture.sourceMessageIdForCase(logicalId);
             YuqiV3ConnectedRaceFixture.CanonicalSeed seed;
@@ -487,7 +487,7 @@ public final class YuqiV3ConnectedRaceTest {
 
     @Test public void ambiguous_remote_timeout_never_falls_back() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.open(context)) {
+        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.openIsolatedApplication(context)) {
             fixture.setLoopbackMode(YuqiV3ConnectedRaceFixture.LoopbackMode.HOLD_THEN_CLOSE);
             fixture.saveLoopbackBridgeConfig();
             ChatTurnEntity submitted = fixture.submitDirectTurn("ambiguous-remote-timeout");
@@ -566,7 +566,7 @@ public final class YuqiV3ConnectedRaceTest {
 
     @Test public void android_fallback_receipt_syncs_without_pc_redelivery() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.open(context)) {
+        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.openIsolatedApplication(context)) {
             String logicalId = "android-fallback-receipt";
             String turnId = fixture.turnIdForCase(logicalId);
             String source = "msg-connected-fallback-" + turnId;
@@ -762,7 +762,7 @@ public final class YuqiV3ConnectedRaceTest {
 
     @Test public void conversation_clear_while_result_in_flight() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.open(context);
+        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.openIsolatedApplication(context);
              YuqiV3WebViewHarness web = YuqiV3WebViewHarness.launch()) {
             String logicalId = "conversation-clear-in-flight";
             String source = fixture.sourceMessageIdForCase(logicalId);
@@ -886,7 +886,7 @@ public final class YuqiV3ConnectedRaceTest {
 
     @Test public void role_delete_pending_suppresses_late_lan_result() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.open(context);
+        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.openIsolatedApplication(context);
              YuqiV3WebViewHarness web = YuqiV3WebViewHarness.launch()) {
             final String logicalId = "role-delete-pending-lan";
             final String turnId = fixture.turnIdForCase(logicalId);
@@ -950,7 +950,7 @@ public final class YuqiV3ConnectedRaceTest {
         }
         // The same authenticated LAN race must consume a strictly parsed
         // v3 VERIFIED_REMOTE_FAILURE without requiring the deleted turn.
-        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.open(context);
+        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.openIsolatedApplication(context);
              YuqiV3WebViewHarness web = YuqiV3WebViewHarness.launch()) {
             final String logicalId = "role-delete-pending-lan-failure";
             final String turnId = fixture.turnIdForCase(logicalId);
@@ -1011,7 +1011,7 @@ public final class YuqiV3ConnectedRaceTest {
 
     @Test public void role_delete_applied_acks_late_cloud_without_semantic_write() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.open(context);
+        try (YuqiV3ConnectedRaceFixture fixture = YuqiV3ConnectedRaceFixture.openIsolatedApplication(context);
              YuqiV3WebViewHarness web = YuqiV3WebViewHarness.launch()) {
             String logicalId = "role-delete-applied-cloud";
             String source = fixture.sourceMessageIdForCase(logicalId);

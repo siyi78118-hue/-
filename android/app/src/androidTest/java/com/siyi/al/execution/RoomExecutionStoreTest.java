@@ -5147,31 +5147,46 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
-    public void sequentialConversationClearRejectsReopenedAuthorityWithoutWrites() throws Exception {
+    public void sequentialConversationClearOpensNewEpochOnlyAfterAppliedClearWithFreshCursor()
+        throws Exception {
         RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
         CanonicalFixture fixture = commitCanonicalFixture("task20b-clear-authority-open", "visible", 550L);
         LifecycleControl first = configured.createConversationClear(
             "yuqi", "device_gateway",
             RoomExecutionStore.conversationCursorChecksum(
                 "yuqi", database.executionDao().conversationCursor("yuqi")), 560L);
-        String beforeCursor = RoomExecutionStore.conversationCursorChecksum(
-            "yuqi", database.executionDao().conversationCursor("yuqi"));
-        String lineage = configured.turn(fixture.localTurnId).authorityLineageKey;
         String oldTombstone = database.executionDao().attempt(
             configured.turn(fixture.localTurnId).activeAttemptId).bridgeAuthorityCheckpointJson;
-        database.getOpenHelper().getWritableDatabase().execSQL(
-            "UPDATE conversation_authorities SET state='OPEN' WHERE authorityLineageKey=?",
-            new Object[]{lineage});
-        assertThrows(IllegalStateException.class, () -> configured.createConversationClear(
-            "yuqi", "device_gateway", beforeCursor, 570L));
-        assertEquals(beforeCursor, RoomExecutionStore.conversationCursorChecksum(
-            "yuqi", database.executionDao().conversationCursor("yuqi")));
+
+        LifecycleControl claimed = configured.claimLifecycleControl(565L);
+        String relay = LifecycleControlSender.relayMessageId(claimed);
+        assertTrue(configured.acceptLifecycleRelay(
+            claimed.controlId, claimed.semanticChecksum, claimed.leaseId,
+            claimed.leaseAttempt, claimed.leasedAt, relay, 1_000L, 566L));
+        assertTrue(configured.applyLifecycleControl(
+            claimed.controlId, claimed.semanticChecksum, claimed.clearEpoch,
+            claimed.clearedThroughSequence, 567L, 568L));
+        assertEquals(LifecycleControl.APPLIED,
+            configured.lifecycleControl(first.controlId).state);
+
+        ConversationCursorEntity afterFirst = database.executionDao().conversationCursor("yuqi");
+        String freshCursor = RoomExecutionStore.conversationCursorChecksum("yuqi", afterFirst);
+        LifecycleControl second = configured.createConversationClear(
+            "yuqi", "device_gateway", freshCursor, 570L);
+        assertNotEquals(first.controlId, second.controlId);
+        assertEquals(Long.valueOf(first.clearEpoch + 1L), second.clearEpoch);
+        assertEquals(LifecycleControl.WAITING, second.state);
+        assertEquals(LifecycleControl.APPLIED,
+            configured.lifecycleControl(first.controlId).state);
         assertEquals(oldTombstone, database.executionDao().attempt(
             configured.turn(fixture.localTurnId).activeAttemptId).bridgeAuthorityCheckpointJson);
-        assertEquals("OPEN", database.executionDao().conversationAuthority(lineage).state);
-        assertEquals(1L, rowCount("lifecycle_controls"));
-        assertEquals(first.controlId,
-            database.executionDao().lifecycleControls().get(0).controlId);
+        assertEquals(2L, rowCount("lifecycle_controls"));
+
+        assertThrows(IllegalStateException.class, () -> configured.createConversationClear(
+            "yuqi", "device_gateway", repeat('0', 64), 571L));
+        assertEquals(freshCursor, RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi")));
+        assertEquals(2L, rowCount("lifecycle_controls"));
     }
 
     @Test

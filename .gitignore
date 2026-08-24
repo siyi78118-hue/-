@@ -16,7 +16,28 @@ android/app/build/
 .gradle-isolated-build/
 android/local.properties
 android/app/google-services.json
+android/app/src/debug/google-services.json
 android/app/*.p12
 firebase-adminsdk-*.json
 artifacts/legacy-installers/*.apk
 shortcuts/*.lnk
+
+# Local/private A.L. data and generated deliverables. Keep these on the
+# workstation; never publish them with the source tree.
+artifacts/*.apk
+artifacts/*.zip
+artifacts/e2e/
+artifacts/snapshots/
+artifacts/yuqi-lived-agency-v3/
+artifacts/qa/*.sql
+artifacts/qa/*.json
+case-analysis/
+case-formulation-v2/
+analysis_tools/
+*.docx
+scripts/__pycache__/
+.superpowers/
+
+# User-supplied third-party preset exports are local inputs. The tracked
+# curated catalog and review notes remain publishable.
+preset-references/*.json

@@ -43,7 +43,6 @@ public final class YuqiV3ConnectedRaceFixture implements AutoCloseable {
     public final AlExecutionDatabase database;
     public final RoomExecutionStore store;
     private final String casePrefix;
-    private final Map<String, ?> originalSecretPreferences;
     private final boolean notificationPermissionInitiallyGranted;
     private ServerSocket loopback;
     private Thread loopbackThread;
@@ -62,24 +61,16 @@ public final class YuqiV3ConnectedRaceFixture implements AutoCloseable {
     private volatile Throwable roomHoldFailure;
     private volatile boolean roomHoldAutoTimedOut;
 
-    private YuqiV3ConnectedRaceFixture(Context context) {
+    private YuqiV3ConnectedRaceFixture(Context context, AlExecutionDatabase isolatedDatabase) {
         this.context = context.getApplicationContext();
-        this.database = AlExecutionDatabase.get(this.context);
+        if (isolatedDatabase == null) {
+            throw new IllegalArgumentException("isolated connected-test database is required");
+        }
+        this.database = isolatedDatabase;
         this.casePrefix = "connected-" + UUID.randomUUID().toString().replace("-", "");
-        this.originalSecretPreferences = this.context.getSharedPreferences(
-            "al.execution.secrets.v1.prefs", Context.MODE_PRIVATE).getAll();
         this.notificationPermissionInitiallyGranted =
             this.context.checkSelfPermission("android.permission.POST_NOTIFICATIONS")
                 == PackageManager.PERMISSION_GRANTED;
-        // Each connected case owns a clean durable boundary.  This uses only
-        // public Room/context APIs; no production table or state transition is
-        // replaced by test SQL.
-        this.database.clearAllTables();
-        this.context.getSharedPreferences(
-            "al.execution.secrets.v1.prefs", Context.MODE_PRIVATE).edit().clear().commit();
-        NotificationManager notifications =
-            (NotificationManager) this.context.getSystemService(Context.NOTIFICATION_SERVICE);
-        if (notifications != null) notifications.cancelAll();
         this.store = new RoomExecutionStore(database, "device-connected-race");
     }
 
@@ -117,9 +108,34 @@ public final class YuqiV3ConnectedRaceFixture implements AutoCloseable {
     }
 
     public static YuqiV3ConnectedRaceFixture open(Context context) {
-        YuqiV3ConnectedRaceFixture fixture = new YuqiV3ConnectedRaceFixture(context);
+        throw new IllegalStateException(
+            "UNSAFE_CONNECTED_FIXTURE_DISABLED: use an isolated test application/database");
+    }
+
+    /**
+     * Reserved for a future isolated test application.  The caller must own
+     * the database instance; this method never resolves the production
+     * singleton and never clears application data.
+     */
+    static YuqiV3ConnectedRaceFixture openIsolated(
+        Context context, AlExecutionDatabase isolatedDatabase
+    ) {
+        YuqiV3ConnectedRaceFixture fixture =
+            new YuqiV3ConnectedRaceFixture(context, isolatedDatabase);
         fixture.startLoopback();
         return fixture;
+    }
+
+    /**
+     * Opens the singleton database only for the dedicated isolated-test
+     * application. The package check is deliberately before any Room,
+     * preferences, notification, or WebView access.
+     */
+    public static YuqiV3ConnectedRaceFixture openIsolatedApplication(Context context) {
+        if (context == null || !"com.siyi.al.isolated".equals(context.getPackageName())) {
+            throw new IllegalStateException("ISOLATED_TEST_APPLICATION_REQUIRED");
+        }
+        return openIsolated(context, AlExecutionDatabase.get(context));
     }
 
     public void saveLoopbackBridgeConfig() {
@@ -943,29 +959,9 @@ public final class YuqiV3ConnectedRaceFixture implements AutoCloseable {
             throw new AssertionError("loopback accept worker did not stop");
         }
         if (workerAlive) throw new AssertionError("loopback connection worker did not stop");
-        android.content.SharedPreferences prefs = context.getSharedPreferences(
-            "al.execution.secrets.v1.prefs", Context.MODE_PRIVATE);
-        android.content.SharedPreferences.Editor restore = prefs.edit().clear();
-        for (Map.Entry<String, ?> entry : originalSecretPreferences.entrySet()) {
-            Object value = entry.getValue();
-            if (value instanceof String) restore.putString(entry.getKey(), (String) value);
-            else if (value instanceof Boolean) restore.putBoolean(entry.getKey(), (Boolean) value);
-            else if (value instanceof Integer) restore.putInt(entry.getKey(), (Integer) value);
-            else if (value instanceof Long) restore.putLong(entry.getKey(), (Long) value);
-            else if (value instanceof Float) restore.putFloat(entry.getKey(), (Float) value);
-            else if (value instanceof java.util.Set) {
-                @SuppressWarnings("unchecked") java.util.Set<String> values =
-                    (java.util.Set<String>) value;
-                restore.putStringSet(entry.getKey(), values);
-            }
-        }
-        if (!restore.commit()) throw new AssertionError("connected fixture secret restore failed");
-        // Do not revoke a runtime permission from the target process while the
-        // instrumentation process is still alive: Android terminates the target
-        // on revoke, which makes a passing test look like an instrumentation
-        // crash.  NotificationManager.cancelAll above removes every case
-        // notification; UTP uninstalls the target APK after the run, restoring
-        // the permission boundary without a self-inflicted process kill.
+        // This fixture never mutates production preferences or notifications.
+        // An isolated test application owns those resources and is responsible
+        // for its own teardown.
         if (loopbackFailure != null) throw new AssertionError("connected loopback failed", loopbackFailure);
     }
 
