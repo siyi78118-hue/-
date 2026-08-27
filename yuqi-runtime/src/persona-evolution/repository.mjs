@@ -15,6 +15,8 @@ export class PersonaEvolutionRepository {
   async listMemories(_roleId, _options) { throw new Error('not implemented'); }
   async createSessionSummary(_roleId, _input) { throw new Error('not implemented'); }
   async getSessionSummary(_roleId, _summaryId) { throw new Error('not implemented'); }
+  async getSessionSummaryBySourceSessionId(_roleId, _sourceSessionId) { throw new Error('not implemented'); }
+  async putSessionSummaryForSession(_roleId, _input) { throw new Error('not implemented'); }
   async listSessionSummaries(_roleId, _options) { throw new Error('not implemented'); }
   async createExperienceInterpretation(_roleId, _input) { throw new Error('not implemented'); }
   async getExperienceInterpretation(_roleId, _interpretationId) { throw new Error('not implemented'); }

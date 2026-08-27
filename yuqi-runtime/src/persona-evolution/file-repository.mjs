@@ -14,6 +14,7 @@ import { PersonaEvolutionRepository } from './repository.mjs';
 import { ENTITY_TYPES, MEMORY_KINDS, MEMORY_STATUSES, PERSONA_SCHEMA_VERSION, PROPOSAL_OUTCOMES } from './schemas.mjs';
 import {
   validateChangeProposalInput,
+  validateAutomaticSessionSummaryInput,
   validateEntityId,
   validateExpectedRevision,
   validateExperienceInterpretationInput,
@@ -53,6 +54,7 @@ export class FilePersonaEvolutionRepository extends PersonaEvolutionRepository {
     this.rootDir = resolve(rootDir);
     this.now = now;
     this.idFactory = idFactory;
+    this.sessionSummaryOperations = new Map();
   }
 
   #inside(path) {
@@ -233,6 +235,54 @@ export class FilePersonaEvolutionRepository extends PersonaEvolutionRepository {
 
   async getSessionSummary(roleId, summaryId) {
     return this.#read(this.#entityPath(roleId, ENTITY_TYPES.SESSION_SUMMARY, summaryId), ENTITY_TYPES.SESSION_SUMMARY, roleId);
+  }
+
+  async getSessionSummaryBySourceSessionId(roleId, sourceSessionId) {
+    validateRoleId(roleId);
+    if (typeof sourceSessionId !== 'string' || !/^ses_[a-f0-9]{64}$/.test(sourceSessionId)) {
+      throw new PersonaValidationError('sourceSessionId has an invalid identity');
+    }
+    const matches = (await this.listSessionSummaries(roleId)).filter(
+      entity => entity.sourceSessionId === sourceSessionId
+    );
+    if (matches.length > 1) throw new PersonaDataCorruptionError('duplicate automatic session summaries');
+    return matches[0] || null;
+  }
+
+  async putSessionSummaryForSession(roleId, input) {
+    validateRoleId(roleId);
+    validateAutomaticSessionSummaryInput(input);
+    const key = `${roleId}\0${input.sourceSessionId}`;
+    const before = this.sessionSummaryOperations.get(key) || Promise.resolve();
+    const current = before.catch(() => {}).then(async () => {
+      const existing = await this.getSessionSummaryBySourceSessionId(roleId, input.sourceSessionId);
+      if (!existing) {
+        const entity = this.#entity(ENTITY_TYPES.SESSION_SUMMARY, roleId, input);
+        validatePersistedEntity(entity, ENTITY_TYPES.SESSION_SUMMARY);
+        await this.#atomicCreate(this.#entityPath(roleId, ENTITY_TYPES.SESSION_SUMMARY, entity.id), entity);
+        return { status: 'created', entity: clone(entity) };
+      }
+      if (existing.sourceDigest === input.sourceDigest) {
+        return { status: 'unchanged', entity: clone(existing) };
+      }
+      const updated = {
+        ...existing,
+        ...clone(input),
+        updatedAt: normalizeNow(this.now),
+        revision: existing.revision + 1
+      };
+      validatePersistedEntity(updated, ENTITY_TYPES.SESSION_SUMMARY);
+      await this.#atomicReplace(
+        this.#entityPath(roleId, ENTITY_TYPES.SESSION_SUMMARY, existing.id),
+        updated
+      );
+      return { status: 'updated', entity: clone(updated) };
+    });
+    const tail = current.finally(() => {
+      if (this.sessionSummaryOperations.get(key) === tail) this.sessionSummaryOperations.delete(key);
+    });
+    this.sessionSummaryOperations.set(key, tail);
+    return current;
   }
 
   async listSessionSummaries(roleId, options = {}) {

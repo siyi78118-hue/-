@@ -28,6 +28,18 @@
       "supervisor": { "model": "gpt-5.6-terra", "effort": "medium" }
     }
   },
+  "sessionSummary": {
+    "enabled": true,
+    "rootDir": "local_data/persona",
+    "roleIds": ["yuqi"],
+    "idleTimeoutMs": 1800000,
+    "sweepIntervalMs": 60000,
+    "pageSize": 500,
+    "maxInputBytes": 65536,
+    "model": "gpt-5.6-sol",
+    "effort": "medium",
+    "turnTimeoutMs": 120000
+  },
   "cloudRelay": {
     "enabled": false,
     "url": "https://al-cloud-timer.example.workers.dev",

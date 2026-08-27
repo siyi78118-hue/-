@@ -36,10 +36,19 @@ export const COMMON_ENTITY_KEYS = Object.freeze([
   'id', 'entityType', 'schemaVersion', 'roleId', 'createdAt', 'updatedAt', 'revision'
 ]);
 
+export const LEGACY_SESSION_SUMMARY_PAYLOAD_KEYS = Object.freeze([
+  'sourceSessionRef', 'startedAt', 'endedAt', 'summary', 'keyEvents', 'sourceRefs'
+]);
+
+export const AUTOMATIC_SESSION_SUMMARY_PAYLOAD_KEYS = Object.freeze([
+  'sourceSessionId', 'startedAt', 'endedAt', 'sourceMessageIds', 'sourceDigest',
+  'keyEvents', 'emotionalSummary', 'importantDecisions', 'generation'
+]);
+
 export const ENTITY_PAYLOAD_KEYS = Object.freeze({
   personality_state: ['selfDescription', 'tendencies', 'tensions'],
   memory: ['kind', 'content', 'confidence', 'status', 'sourceRefs', 'supersedesId', 'supersededById'],
-  session_summary: ['sourceSessionRef', 'startedAt', 'endedAt', 'summary', 'keyEvents', 'sourceRefs'],
+  session_summary: LEGACY_SESSION_SUMMARY_PAYLOAD_KEYS,
   experience_interpretation: ['sessionSummaryId', 'meaning', 'selfImpact', 'hypotheses', 'sourceRefs'],
   change_proposal: [
     'interpretationIds', 'outcome', 'rationale', 'proposedChanges',

@@ -17500,6 +17500,111 @@ export class YuqiStore {
     `).all(characterId, safeLimit).map(mapMessage);
   }
 
+  listCanonicalVisibleConversationItems(roleId, { cursor = null, limit = 500 } = {}) {
+    const normalizedRoleId = String(roleId || '').trim();
+    if (!normalizedRoleId) throw new Error('visible conversation roleId is required');
+    const safeLimit = Math.max(1, Math.min(1000, Number(limit) || 500));
+    let afterTime = -1;
+    let afterKey = '';
+    if (cursor !== null) {
+      try {
+        const parsed = JSON.parse(Buffer.from(String(cursor), 'base64url').toString('utf8'));
+        if (!Array.isArray(parsed) || parsed.length !== 2
+          || !Number.isSafeInteger(parsed[0]) || parsed[0] < 0
+          || typeof parsed[1] !== 'string' || !parsed[1]) throw new Error('invalid');
+        [afterTime, afterKey] = parsed;
+      } catch {
+        throw new Error('visible conversation cursor is invalid');
+      }
+    }
+    const rows = this.db.prepare(`
+      SELECT * FROM (
+        SELECT
+          'message:' || m.message_id AS item_key,
+          'message' AS item_type,
+          m.message_id AS item_id,
+          m.sent_at AS occurred_at,
+          COALESCE(NULLIF(t.lane_key, ''), 'private_chat') AS conversation_id,
+          m.speaker_type AS speaker_type,
+          m.content AS visible_content,
+          NULL AS action_kind,
+          NULL AS action_json
+        FROM messages m
+        JOIN turns t ON t.turn_id = m.turn_id
+        LEFT JOIN visible_result_groups g ON g.group_id = m.authority_group_id
+        LEFT JOIN visible_commit_receipts r ON r.group_id = g.group_id
+        WHERE m.character_id = ?
+          AND m.message_id NOT IN (SELECT message_id FROM suppressed_messages)
+          AND t.state != 'cancelled'
+          AND typeof(m.content) = 'text' AND length(trim(m.content)) > 0
+          AND (
+            (t.result_authority_version = 0 AND (
+              m.speaker_type = 'user'
+              OR (m.speaker_type = 'character' AND t.state IN ('completed','committed','delivered','fallback'))
+            ))
+            OR (
+              t.result_authority_version = 1 AND m.speaker_type = 'user'
+              AND EXISTS (
+                SELECT 1 FROM current_user_batch_items bi
+                WHERE bi.message_id = m.message_id AND bi.message_json IS NOT NULL AND bi.redacted_at IS NULL
+              )
+            )
+            OR (
+              t.result_authority_version = 1 AND m.speaker_type = 'character'
+              AND m.authority_group_id IS NOT NULL AND g.redacted_at IS NULL
+              AND r.commit_checksum IS NOT NULL
+            )
+          )
+        UNION ALL
+        SELECT
+          'action:' || a.action_id AS item_key,
+          'action' AS item_type,
+          a.action_id AS item_id,
+          g.created_at AS occurred_at,
+          g.lane_key AS conversation_id,
+          'system_event' AS speaker_type,
+          NULL AS visible_content,
+          a.action_kind AS action_kind,
+          a.action_json AS action_json
+        FROM visible_result_actions a
+        JOIN visible_result_groups g ON g.group_id = a.group_id
+        JOIN visible_commit_receipts r ON r.group_id = g.group_id
+        JOIN turn_authority_lineages l ON l.lineage_key = g.lineage_key
+        JOIN turns t ON t.turn_id = g.authoritative_turn_id
+        WHERE g.role_id = ? AND g.redacted_at IS NULL AND a.redacted_at IS NULL
+          AND l.state = 'committed' AND l.committed_group_id = g.group_id
+          AND t.result_authority_version = 1 AND t.state = 'committed'
+      ) visible
+      WHERE occurred_at > ? OR (occurred_at = ? AND item_key > ?)
+      ORDER BY occurred_at ASC, item_key ASC
+      LIMIT ?
+    `).all(normalizedRoleId, normalizedRoleId, afterTime, afterTime, afterKey, safeLimit + 1);
+    const selected = rows.slice(0, safeLimit);
+    const items = selected.map(row => {
+      const content = row.item_type === 'message'
+        ? String(row.visible_content)
+        : `可见动作 ${String(row.action_kind)}：${canonicalJson(parseJson(row.action_json, {}))}`;
+      const speaker = row.item_type === 'action'
+        ? 'system_event'
+        : (row.speaker_type === 'user' ? 'user' : 'assistant');
+      return {
+        id: String(row.item_id),
+        roleId: normalizedRoleId,
+        conversationId: String(row.conversation_id),
+        speaker,
+        createdAt: new Date(Number(row.occurred_at)).toISOString(),
+        content
+      };
+    });
+    const last = selected.at(-1);
+    return {
+      items,
+      nextCursor: rows.length > safeLimit && last
+        ? Buffer.from(JSON.stringify([Number(last.occurred_at), String(last.item_key)]), 'utf8').toString('base64url')
+        : null
+    };
+  }
+
   getMessage(messageId) {
     return mapMessage(this.db.prepare('SELECT * FROM messages WHERE message_id = ?').get(messageId));
   }

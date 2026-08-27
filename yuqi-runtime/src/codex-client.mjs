@@ -348,6 +348,55 @@ export class CodexAppServerClient {
     });
   }
 
+  async runIsolatedTurn(input, options = {}) {
+    const text = typeof input === 'string' ? input : JSON.stringify(input);
+    if (!text.trim()) throw new Error('Codex isolated turn input is empty');
+    if (!options.outputSchema || typeof options.outputSchema !== 'object') {
+      throw new Error('Codex isolated turn outputSchema is required');
+    }
+    await this.start();
+    const threadResult = await this.request('thread/start', {
+      cwd: this.cwd,
+      approvalPolicy: 'never',
+      sandbox: 'read-only'
+    });
+    const threadId = threadResult?.thread?.id;
+    if (!threadId) throw new CodexProtocolError('thread/start returned no thread id');
+    const clientUserMessageId = options.clientUserMessageId || `yuqi_isolated_${randomUUID()}`;
+    const result = await this.request('turn/start', {
+      threadId,
+      clientUserMessageId,
+      input: [{ type: 'text', text }],
+      approvalPolicy: 'never',
+      model: options.model || 'gpt-5.6-sol',
+      effort: options.effort || 'medium',
+      outputSchema: options.outputSchema
+    });
+    const turnId = result?.turn?.id;
+    if (!turnId) throw new CodexProtocolError('turn/start returned no turn id');
+    return this.awaitTurnCompletion(threadId, turnId, Number(options.turnTimeoutMs) || this.turnTimeoutMs);
+  }
+
+  awaitTurnCompletion(threadId, turnId, turnTimeoutMs) {
+    const key = `${threadId}:${turnId}`;
+    const early = this.earlyCompletions.get(key);
+    if (early) {
+      this.earlyCompletions.delete(key);
+      if (early.status !== 'completed' || !early.text.trim()) {
+        return Promise.reject(new CodexTurnError(early.error?.message || 'Codex turn failed', early.status, early.error));
+      }
+      return Promise.resolve(early);
+    }
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.turnWaiters.delete(key);
+        reject(new CodexTurnError('Codex turn timed out', 'timeout'));
+      }, turnTimeoutMs);
+      timeout.unref?.();
+      this.turnWaiters.set(key, { resolve, reject, timeout });
+    });
+  }
+
   async runTurnInternal(role, input, options) {
     const text = typeof input === 'string' ? input : JSON.stringify(input);
     if (!text.trim()) throw new Error('Codex turn input is empty');
@@ -379,24 +428,11 @@ export class CodexAppServerClient {
       }
       await options.onTurnStarted({ threadId, turnId, clientUserMessageId });
     }
-    const key = `${threadId}:${turnId}`;
-
-    const early = this.earlyCompletions.get(key);
-    if (early) {
-      this.earlyCompletions.delete(key);
-      if (early.status !== 'completed' || !early.text.trim()) {
-        throw new CodexTurnError(early.error?.message || 'Codex turn failed', early.status, early.error);
-      }
-      return early;
-    }
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.turnWaiters.delete(key);
-        reject(new CodexTurnError('Codex turn timed out', 'timeout'));
-      }, Number(options.turnTimeoutMs) || this.turnTimeoutMs);
-      timeout.unref?.();
-      this.turnWaiters.set(key, { resolve, reject, timeout });
-    });
+    return this.awaitTurnCompletion(
+      threadId,
+      turnId,
+      Number(options.turnTimeoutMs) || this.turnTimeoutMs
+    );
   }
 
   async interrupt(role, turnId) {

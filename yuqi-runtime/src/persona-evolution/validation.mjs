@@ -1,4 +1,5 @@
 import {
+  AUTOMATIC_SESSION_SUMMARY_PAYLOAD_KEYS,
   COMMON_ENTITY_KEYS,
   ENTITY_PAYLOAD_KEYS,
   ENTITY_TYPES,
@@ -97,6 +98,26 @@ function sourceRefs(value, label = 'sourceRefs') {
   return array(value, label, sourceRef);
 }
 
+function uniqueStrings(value, label, { min = 0 } = {}) {
+  array(value, label, (item, itemLabel) => string(item, itemLabel, { max: MAX_ID }), { min });
+  if (new Set(value).size !== value.length) fail(`${label} must be unique`);
+  return value;
+}
+
+function emotionalSummary(value, label = 'emotionalSummary') {
+  exactKeys(value, ['user', 'al', 'interaction'], label);
+  string(value.user, `${label}.user`, { nullable: true });
+  string(value.al, `${label}.al`, { nullable: true });
+  string(value.interaction, `${label}.interaction`, { nullable: true });
+}
+
+function summaryGeneration(value, label = 'generation') {
+  exactKeys(value, ['summarizerVersion', 'promptVersion', 'model'], label);
+  string(value.summarizerVersion, `${label}.summarizerVersion`, { max: 128 });
+  string(value.promptVersion, `${label}.promptVersion`, { max: 128 });
+  string(value.model, `${label}.model`, { max: 256 });
+}
+
 function uniqueObjectIds(value, label) {
   const ids = value.map(item => item.id);
   if (new Set(ids).size !== ids.length) fail(`${label} ids must be unique`);
@@ -168,6 +189,7 @@ export function validateMemoryInput(input) {
 }
 
 export function validateSessionSummaryInput(input) {
+  if (Object.hasOwn(input || {}, 'sourceSessionId')) return validateAutomaticSessionSummaryInput(input);
   exactKeys(input, ENTITY_PAYLOAD_KEYS[ENTITY_TYPES.SESSION_SUMMARY], 'session summary input');
   string(input.sourceSessionRef, 'sourceSessionRef', { nullable: true, max: MAX_ID });
   isoTimestamp(input.startedAt, 'startedAt');
@@ -176,6 +198,23 @@ export function validateSessionSummaryInput(input) {
   string(input.summary, 'summary');
   array(input.keyEvents, 'keyEvents', (item, label) => string(item, label));
   sourceRefs(input.sourceRefs);
+  return input;
+}
+
+export function validateAutomaticSessionSummaryInput(input) {
+  exactKeys(input, AUTOMATIC_SESSION_SUMMARY_PAYLOAD_KEYS, 'automatic session summary input');
+  string(input.sourceSessionId, 'sourceSessionId', { max: MAX_ID });
+  if (!/^ses_[a-f0-9]{64}$/.test(input.sourceSessionId)) fail('sourceSessionId has an invalid identity');
+  isoTimestamp(input.startedAt, 'startedAt');
+  isoTimestamp(input.endedAt, 'endedAt');
+  if (Date.parse(input.endedAt) < Date.parse(input.startedAt)) fail('endedAt must not be before startedAt');
+  uniqueStrings(input.sourceMessageIds, 'sourceMessageIds', { min: 1 });
+  string(input.sourceDigest, 'sourceDigest', { max: 64 });
+  if (!/^[a-f0-9]{64}$/.test(input.sourceDigest)) fail('sourceDigest must be lowercase SHA-256');
+  array(input.keyEvents, 'keyEvents', (item, label) => string(item, label));
+  emotionalSummary(input.emotionalSummary);
+  array(input.importantDecisions, 'importantDecisions', (item, label) => string(item, label));
+  summaryGeneration(input.generation);
   return input;
 }
 
@@ -234,7 +273,9 @@ export function validateListOptions(options, allowedFilters) {
 }
 
 function validateCommonEntity(entity, expectedType) {
-  const payloadKeys = ENTITY_PAYLOAD_KEYS[expectedType];
+  const payloadKeys = expectedType === ENTITY_TYPES.SESSION_SUMMARY && Object.hasOwn(entity || {}, 'sourceSessionId')
+    ? AUTOMATIC_SESSION_SUMMARY_PAYLOAD_KEYS
+    : ENTITY_PAYLOAD_KEYS[expectedType];
   if (!payloadKeys) fail('entityType is invalid');
   exactKeys(entity, [...COMMON_ENTITY_KEYS, ...payloadKeys], `${expectedType} entity`);
   validateEntityId(expectedType, entity.id);
@@ -249,7 +290,10 @@ function validateCommonEntity(entity, expectedType) {
 
 export function validatePersistedEntity(entity, expectedType) {
   validateCommonEntity(entity, expectedType);
-  const payload = Object.fromEntries(ENTITY_PAYLOAD_KEYS[expectedType].map(key => [key, entity[key]]));
+  const payloadKeys = expectedType === ENTITY_TYPES.SESSION_SUMMARY && Object.hasOwn(entity, 'sourceSessionId')
+    ? AUTOMATIC_SESSION_SUMMARY_PAYLOAD_KEYS
+    : ENTITY_PAYLOAD_KEYS[expectedType];
+  const payload = Object.fromEntries(payloadKeys.map(key => [key, entity[key]]));
   if (expectedType === ENTITY_TYPES.PERSONALITY_STATE) validatePersonalityStateInput(payload);
   if (expectedType === ENTITY_TYPES.MEMORY) validateMemoryInput(payload);
   if (expectedType === ENTITY_TYPES.SESSION_SUMMARY) validateSessionSummaryInput(payload);

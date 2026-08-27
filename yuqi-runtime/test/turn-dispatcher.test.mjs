@@ -34,6 +34,22 @@ test('accept returns before background completion and duplicate accepts run once
   assert.equal(runs, 1);
 });
 
+test('visible-message observation is non-blocking and observer failure cannot fail turn acceptance', async () => {
+  const turn = { turnId: 'turn_observed_1', characterId: 'role_a', state: 'completed' };
+  const observed = [];
+  const dispatcher = new TurnDispatcher({
+    store: { getTurn: () => turn, listRecoverableTurns: () => [] },
+    orchestrator: { accept: () => turn, async run() { return turn; } }
+  });
+  dispatcher.setVisibleMessageObserver(value => {
+    observed.push(value);
+    throw new Error('synthetic observer failure');
+  });
+  assert.equal(dispatcher.accept({ turnId: turn.turnId }), turn);
+  assert.deepEqual(observed, [{ roleId: 'role_a', turnId: 'turn_observed_1' }]);
+  await dispatcher.idle();
+});
+
 test('recover schedules every persisted nonterminal turn', async () => {
   const turns = [
     { turnId: 'turn_recover_1', state: 'memory_running', resultAuthorityVersion: 0 },

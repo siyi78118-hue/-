@@ -14,6 +14,11 @@ import { ResultOutbox } from './result-outbox.mjs';
 import { selectTurnRoute } from './route-policy.mjs';
 import { YuqiStore } from './store.mjs';
 import { composeYuqiExecutionRuntime } from './runtime-composition.mjs';
+import { FilePersonaEvolutionRepository } from './persona-evolution/file-repository.mjs';
+import { StoreSessionConversationSource } from './persona-evolution/session-conversation-source.mjs';
+import { CodexSessionSummaryGenerator } from './persona-evolution/session-summary-generator.mjs';
+import { SessionSummarizer } from './persona-evolution/session-summarizer.mjs';
+import { SessionSummaryWorker } from './persona-evolution/session-summary-worker.mjs';
 import { createSystemCloudFetch } from '../../scripts/cloud-http.mjs';
 import { createVerifiedYuqiBackup } from '../../scripts/backup-yuqi-memory.mjs';
 
@@ -72,6 +77,38 @@ const consolidationWorker = new ConsolidationWorker({
   presetRegistry: presets,
   workerId: 'yuqi-memory-consolidation'
 });
+const sessionSummaryConfig = config.sessionSummary || {};
+const sessionSummaryEnabled = sessionSummaryConfig.enabled !== false;
+const sessionSummaryRoot = isAbsolute(sessionSummaryConfig.rootDir || '')
+  ? sessionSummaryConfig.rootDir
+  : resolve(runtimeDir, sessionSummaryConfig.rootDir || 'local_data/persona');
+const sessionSummaryLogger = event => {
+  process.stdout.write(`[session-summary] ${JSON.stringify(event)}\n`);
+};
+const sessionSummaryWorker = sessionSummaryEnabled ? new SessionSummaryWorker({
+  source: new StoreSessionConversationSource({
+    store,
+    pageSize: Number(sessionSummaryConfig.pageSize) || 500
+  }),
+  summarizer: new SessionSummarizer({
+    repository: new FilePersonaEvolutionRepository({ rootDir: sessionSummaryRoot }),
+    generator: new CodexSessionSummaryGenerator({
+      codexClient: codex,
+      model: sessionSummaryConfig.model || 'gpt-5.6-sol',
+      effort: sessionSummaryConfig.effort || 'medium',
+      turnTimeoutMs: Number(sessionSummaryConfig.turnTimeoutMs) || 120_000
+    }),
+    maxInputBytes: Number(sessionSummaryConfig.maxInputBytes) || 64 * 1024,
+    logger: sessionSummaryLogger
+  }),
+  roleIds: Array.isArray(sessionSummaryConfig.roleIds) && sessionSummaryConfig.roleIds.length
+    ? sessionSummaryConfig.roleIds
+    : ['yuqi'],
+  idleTimeoutMs: Number(sessionSummaryConfig.idleTimeoutMs) || 30 * 60 * 1000,
+  sweepIntervalMs: Number(sessionSummaryConfig.sweepIntervalMs) || 60 * 1000,
+  logger: sessionSummaryLogger
+}) : null;
+dispatcher.setVisibleMessageObserver(event => sessionSummaryWorker?.observeVisibleMessage(event));
 const explicitProxy = config.cloudRelay?.proxy?.enabled === true;
 const cloudFetch = config.cloudRelay?.enabled
   ? (explicitProxy ? globalThis.fetch : createSystemCloudFetch())
@@ -129,6 +166,7 @@ dispatcher.recover();
 lifePlanningDispatcher.recover();
 lifePlanningDispatcher.start();
 consolidationWorker.start();
+sessionSummaryWorker?.start();
 shadowDispatcher.start();
 cloudPump?.start(config.cloudRelay.pollIntervalMs || 1500);
 function checkLifePlanning() {
@@ -154,6 +192,7 @@ async function stop() {
   clearInterval(lifeBoundaryTimer);
   try { await lifePlanningDispatcher.stop(); } catch {}
   try { await consolidationWorker.stop(); } catch {}
+  try { sessionSummaryWorker?.stop(); await sessionSummaryWorker?.idle(); } catch {}
   try { shadowDispatcher.stop(); } catch {}
   try { cloudPump?.stop(); } catch {}
   try { await server.close(); } catch {}

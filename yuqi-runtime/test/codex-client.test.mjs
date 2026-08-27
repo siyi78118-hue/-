@@ -7,6 +7,7 @@ import test from 'node:test';
 
 import { CodexAppServerClient } from '../src/codex-client.mjs';
 import { COGNITION_SCHEMA_V3 } from '../src/role-schemas.mjs';
+import { SESSION_SUMMARY_OUTPUT_SCHEMA } from '../src/persona-evolution/session-summary-prompt.mjs';
 import { YuqiStore } from '../src/store.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -113,6 +114,27 @@ test('keeps the three role sessions isolated', async () => fixture(async ({ clie
   assert.equal(store.getSession('memory'), memory.threadId);
   assert.equal(store.getSession('brain'), brain.threadId);
   assert.equal(store.getSession('supervisor'), supervisor.threadId);
+}));
+
+test('runs a one-shot isolated turn without reading or mutating cognition role sessions', async () => fixture(async ({ client, store, logFile }) => {
+  store.setSession('memory', 'thr_memory');
+  store.setSession('brain', 'thr_brain');
+  store.setSession('supervisor', 'thr_supervisor');
+  const before = ['memory', 'brain', 'supervisor'].map(role => store.getSessionState(role));
+  const result = await client.runIsolatedTurn('summarize synthetic visible messages', {
+    model: 'gpt-5.6-sol', effort: 'medium', outputSchema: SESSION_SUMMARY_OUTPUT_SCHEMA
+  });
+  assert.equal(result.threadId, 'thr_new_1');
+  assert.deepEqual(['memory', 'brain', 'supervisor'].map(role => store.getSessionState(role)), before);
+  assert.deepEqual(methods(logFile), ['initialize', 'initialized', 'thread/start', 'turn/start']);
+  const lines = protocolLines(logFile);
+  const threadStart = lines.find(item => item.method === 'thread/start');
+  const turnStart = lines.find(item => item.method === 'turn/start');
+  assert.equal(threadStart.params.sandbox, 'read-only');
+  assert.equal(turnStart.params.threadId, 'thr_new_1');
+  assert.equal(turnStart.params.model, 'gpt-5.6-sol');
+  assert.equal(turnStart.params.effort, 'medium');
+  assert.deepEqual(turnStart.params.outputSchema, SESSION_SUMMARY_OUTPUT_SCHEMA);
 }));
 
 test('rotates a dedicated role thread after the configured successful turn count', async () => fixture(async ({ client, store, logFile }) => {

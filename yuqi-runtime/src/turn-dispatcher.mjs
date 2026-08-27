@@ -24,10 +24,19 @@ export class TurnDispatcher {
     this.orchestrator = orchestrator;
     this.store = store;
     this.inflight = new Map();
+    this.visibleMessageObserver = null;
+  }
+
+  setVisibleMessageObserver(observer) {
+    if (observer !== null && typeof observer !== 'function') throw new Error('visible message observer must be a function');
+    this.visibleMessageObserver = observer;
   }
 
   accept(envelope) {
     const turn = this.orchestrator.accept(envelope);
+    try {
+      this.visibleMessageObserver?.({ roleId: turn.characterId, turnId: turn.turnId });
+    } catch {}
     this.schedule(turn.turnId);
     return turn;
   }
