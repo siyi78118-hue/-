@@ -1,0 +1,23 @@
+{
+  "id": "sum_synthetic_1",
+  "entityType": "session_summary",
+  "schemaVersion": 1,
+  "roleId": "synthetic_role",
+  "createdAt": "2026-08-27T10:32:00.000Z",
+  "updatedAt": "2026-08-27T10:32:00.000Z",
+  "revision": 1,
+  "sourceSessionRef": "synthetic_session_1",
+  "startedAt": "2026-08-27T09:00:00.000Z",
+  "endedAt": "2026-08-27T10:00:00.000Z",
+  "summary": "Two synthetic participants compared direct explanation with cautious agreement.",
+  "keyEvents": [
+    "One participant asked for a clearer independent judgment.",
+    "They agreed to distinguish evidence from interpretation."
+  ],
+  "sourceRefs": [
+    {
+      "type": "session",
+      "id": "synthetic_session_1"
+    }
+  ]
+}

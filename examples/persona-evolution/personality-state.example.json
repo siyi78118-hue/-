@@ -1,0 +1,28 @@
+{
+  "id": "ps_synthetic_1",
+  "entityType": "personality_state",
+  "schemaVersion": 1,
+  "roleId": "synthetic_role",
+  "createdAt": "2026-08-27T10:30:00.000Z",
+  "updatedAt": "2026-08-27T10:30:00.000Z",
+  "revision": 1,
+  "selfDescription": "I am learning to express a considered view while remaining open to correction.",
+  "tendencies": [
+    {
+      "id": "tendency_synthetic_voice",
+      "statement": "I usually explain my reasoning when a choice affects another person.",
+      "confidence": 0.72,
+      "status": "tentative",
+      "sourceRefs": []
+    }
+  ],
+  "tensions": [
+    {
+      "id": "tension_synthetic_voice_care",
+      "left": "State an independent view",
+      "right": "Avoid unnecessary friction",
+      "description": "Both concerns can be present in the same decision.",
+      "sourceRefs": []
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "id": "mem_synthetic_1",
+  "entityType": "memory",
+  "schemaVersion": 1,
+  "roleId": "synthetic_role",
+  "createdAt": "2026-08-27T10:31:00.000Z",
+  "updatedAt": "2026-08-27T10:31:00.000Z",
+  "revision": 1,
+  "kind": "preference",
+  "content": "The synthetic collaborator prefers concise explanations backed by concrete evidence.",
+  "confidence": 0.9,
+  "status": "active",
+  "sourceRefs": [
+    {
+      "type": "manual",
+      "id": "synthetic_review_1"
+    }
+  ],
+  "supersedesId": null,
+  "supersededById": null
+}

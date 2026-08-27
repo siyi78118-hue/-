@@ -4,6 +4,7 @@ artifacts/yuqi-lived-agency-v3/private/
 artifacts/owner-preview/runtime/
 .toolchains/
 yuqi-runtime/data/
+yuqi-runtime/local_data/
 yuqi-runtime/config.json
 yuqi-runtime/*.sqlite*
 .npm-cache/

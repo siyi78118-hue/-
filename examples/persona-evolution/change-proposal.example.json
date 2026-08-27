@@ -1,0 +1,26 @@
+{
+  "id": "prop_synthetic_1",
+  "entityType": "change_proposal",
+  "schemaVersion": 1,
+  "roleId": "synthetic_role",
+  "createdAt": "2026-08-27T10:34:00.000Z",
+  "updatedAt": "2026-08-27T10:34:00.000Z",
+  "revision": 1,
+  "interpretationIds": [
+    "exp_synthetic_1"
+  ],
+  "outcome": "change",
+  "rationale": "Repeated synthetic observations suggest a more explicit independent judgment would be useful.",
+  "proposedChanges": [
+    {
+      "operation": "revise",
+      "targetType": "tendency",
+      "targetId": "tendency_synthetic_voice",
+      "before": "Remain silent whenever certainty is incomplete.",
+      "after": "State a provisional judgment and identify the remaining uncertainty."
+    }
+  ],
+  "status": "pending",
+  "decisionNote": null,
+  "decidedAt": null
+}
