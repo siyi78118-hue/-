@@ -251,7 +251,7 @@ File Repository 只是实验 backend，长期可以迁移到 SQLite。
 
 不应因为建立实验 Repository，就把它宣布为新的正式 canonical authority；也不应在没有明确决定前替换现有长期事实或认知来源。
 
-当前源码中已经存在记忆、证据校验、备份和相关运行时测试，但这些相关实现不能仅凭文件名被等同为 Persona Evolution Storage v0.1 已完成。是否完成要以专门的接口、测试和验收结果确认。
+当前 `codex/al-tdd` 已有专门的五实体 Repository、严格验证、角色隔离、持久化与提案决策测试。File Repository 仍是实验 backend，不替代现有正式 canonical authority。
 
 ### 阶段二：Session Summarizer v0.1
 
@@ -276,11 +276,11 @@ Summary 重点包含：
 
 同一 session 的 Summary 只需要最新状态，不需要保存大量历史版本。
 
-该阶段是否已经满足自动触发、最新状态覆盖和字段要求，必须结合实际代码和测试确认，不能只依据计划名称判断完成。
+当前 `codex/al-tdd` 已实现自动触发、最新状态覆盖、启动恢复、失败隔离与专项测试；Summary 仍只描述发生了什么，不承担经历解释。
 
 ### 阶段三：Experience Interpreter v0.1
 
-当前讨论准备进入这一阶段。
+该阶段已在 `codex/al-tdd` 实现并完成确定性测试、全项目回归与四组真实模型 synthetic smoke。生产配置默认关闭，尚未作为正式人格修改机制启用。
 
 目标输入为：
 
@@ -298,7 +298,7 @@ Experience Interpretation
 
 这一阶段的核心问题不是简单总结发生过的事件，而是解释经历对自身意味着什么。
 
-当前下一步是制定第三阶段完整的 Codex 执行任务书。
+当前实现使用现有 `experience_interpretation` entity，不建立第二套人格或记忆系统；同一 Summary 幂等，合法修订更新同一 Interpretation，并支持启动恢复。
 
 第三阶段暂不直接：
 - 修改 Personality State
@@ -333,13 +333,13 @@ Experience Interpreter 允许引用相关长期记忆，不能只看当前 Sessi
 
 但每次只使用与当前经历相关的少量长期记忆，不把所有 Memory 全部塞入上下文。
 
-具体 retrieval 方法尚未正式决定。
+v0.1 使用可替换的 deterministic Unicode lexical retrieval，只读取同角色的 active Memory，默认最多 8 条，并保留冲突和低置信度证据。
 
 ### 影响强度
 
 Experience Interpretation 必须输出这段经历对自身认知的影响强度。
 
-具体采用连续数字还是离散等级、Schema 和分级方式尚未最终确定。
+v0.1 已确定使用 `none / low / medium / high` 四个离散等级，表示对长期自我理解的影响，不表示当时情绪强度。
 
 ### 升级标记
 
@@ -357,14 +357,13 @@ Experience Interpreter 本身绝对不能直接创建或执行人格修改。
 
 ### Experience Interpreter
 
-尚未决定：
-- 影响强度采用连续数字还是离散等级
-- 长期记忆 retrieval 的具体方式
-- 一次 interpretation 允许引用多少条长期记忆
-- interpretation 是否允许引用多次经历之间的关系
-- 是否需要 disagreement 或 uncertainty 字段
-- 如何避免 Interpreter 为了“人格成长”而过度解释普通聊天
-- 如何区分短期情绪、局部印象和可能具有长期影响的经历
+v0.1 已通过保守 Prompt、离散影响等级、证据置信度、冲突 Memory、假设列表与下一阶段建议字段落实最小闭环。真实模型 smoke 中，普通闲聊没有被强造成长，单方面用户标签没有被直接当作人格事实，重复模式能够结合相反证据并保留不确定性。
+
+仍需通过长期实际样本观察：
+- `medium/high` 是否偏多
+- 单次自我冲突是否过早建议进入下一阶段评估
+- lexical retrieval 在真实中文长期记忆中的召回和误召回
+- 是否需要独立的 disagreement / uncertainty 字段
 
 ### Persona Evolution
 
@@ -416,20 +415,9 @@ ChatGPT 应根据语义定位到对应章节和实际源码，而不是要求用
 
 当前讨论停在：
 
-**Experience Interpreter v0.1**
+**Experience Interpreter v0.1 已实现并保持默认关闭；Stage 4 尚未开始。**
 
-下一步是制定第三阶段完整 Codex 执行任务书。
-
-任务书至少需要落实当前已经确认的四点：
-
-```text
-第一人称
-允许引用少量相关长期记忆
-输出影响强度
-输出是否建议进入 Personality Change Proposal 的标记
-```
-
-同时必须保留以下边界：
+后续首先观察 Stage 3 的真实质量与分布，不自动进入 Personality Change Proposal Generator。必须继续保留以下边界：
 
 ```text
 不直接修改 Personality State
