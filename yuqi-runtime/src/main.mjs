@@ -15,6 +15,10 @@ import { selectTurnRoute } from './route-policy.mjs';
 import { YuqiStore } from './store.mjs';
 import { composeYuqiExecutionRuntime } from './runtime-composition.mjs';
 import { FilePersonaEvolutionRepository } from './persona-evolution/file-repository.mjs';
+import { ExperienceInterpreter } from './persona-evolution/experience-interpreter.mjs';
+import { CodexExperienceInterpretationGenerator } from './persona-evolution/experience-interpretation-generator.mjs';
+import { ExperienceInterpretationWorker } from './persona-evolution/experience-interpretation-worker.mjs';
+import { ExperienceMemoryRetriever } from './persona-evolution/experience-memory-retriever.mjs';
 import { StoreSessionConversationSource } from './persona-evolution/session-conversation-source.mjs';
 import { CodexSessionSummaryGenerator } from './persona-evolution/session-summary-generator.mjs';
 import { SessionSummarizer } from './persona-evolution/session-summarizer.mjs';
@@ -85,13 +89,48 @@ const sessionSummaryRoot = isAbsolute(sessionSummaryConfig.rootDir || '')
 const sessionSummaryLogger = event => {
   process.stdout.write(`[session-summary] ${JSON.stringify(event)}\n`);
 };
+const personaRepository = new FilePersonaEvolutionRepository({ rootDir: sessionSummaryRoot });
+const experienceInterpreterConfig = config.experienceInterpreter || {};
+const experienceInterpreterEnabled = experienceInterpreterConfig.enabled === true;
+const experienceInterpreterLogger = event => {
+  process.stdout.write(`[experience-interpretation] ${JSON.stringify(event)}\n`);
+};
+const experienceRoleIds = Array.isArray(experienceInterpreterConfig.roleIds)
+  && experienceInterpreterConfig.roleIds.length
+  ? experienceInterpreterConfig.roleIds
+  : Array.isArray(sessionSummaryConfig.roleIds) && sessionSummaryConfig.roleIds.length
+    ? sessionSummaryConfig.roleIds
+    : ['yuqi'];
+const configuredMemoryLimit = Number(experienceInterpreterConfig.memoryLimit);
+const experienceInterpretationWorker = experienceInterpreterEnabled
+  ? new ExperienceInterpretationWorker({
+    repository: personaRepository,
+    interpreter: new ExperienceInterpreter({
+      repository: personaRepository,
+      retriever: new ExperienceMemoryRetriever(),
+      generator: new CodexExperienceInterpretationGenerator({
+        codexClient: codex,
+        model: experienceInterpreterConfig.model || 'gpt-5.6-sol',
+        effort: experienceInterpreterConfig.effort || 'medium',
+        turnTimeoutMs: Number(experienceInterpreterConfig.turnTimeoutMs) || 120_000
+      }),
+      memoryLimit: Number.isSafeInteger(configuredMemoryLimit) && configuredMemoryLimit >= 0
+        ? configuredMemoryLimit
+        : 8,
+      logger: experienceInterpreterLogger
+    }),
+    roleIds: experienceRoleIds,
+    sweepIntervalMs: Number(experienceInterpreterConfig.sweepIntervalMs) || 60 * 1000,
+    logger: experienceInterpreterLogger
+  })
+  : null;
 const sessionSummaryWorker = sessionSummaryEnabled ? new SessionSummaryWorker({
   source: new StoreSessionConversationSource({
     store,
     pageSize: Number(sessionSummaryConfig.pageSize) || 500
   }),
   summarizer: new SessionSummarizer({
-    repository: new FilePersonaEvolutionRepository({ rootDir: sessionSummaryRoot }),
+    repository: personaRepository,
     generator: new CodexSessionSummaryGenerator({
       codexClient: codex,
       model: sessionSummaryConfig.model || 'gpt-5.6-sol',
@@ -106,7 +145,8 @@ const sessionSummaryWorker = sessionSummaryEnabled ? new SessionSummaryWorker({
     : ['yuqi'],
   idleTimeoutMs: Number(sessionSummaryConfig.idleTimeoutMs) || 30 * 60 * 1000,
   sweepIntervalMs: Number(sessionSummaryConfig.sweepIntervalMs) || 60 * 1000,
-  logger: sessionSummaryLogger
+  logger: sessionSummaryLogger,
+  onSummaryFinalized: event => experienceInterpretationWorker?.observeSummary(event)
 }) : null;
 dispatcher.setVisibleMessageObserver(event => sessionSummaryWorker?.observeVisibleMessage(event));
 const explicitProxy = config.cloudRelay?.proxy?.enabled === true;
@@ -166,6 +206,7 @@ dispatcher.recover();
 lifePlanningDispatcher.recover();
 lifePlanningDispatcher.start();
 consolidationWorker.start();
+experienceInterpretationWorker?.start();
 sessionSummaryWorker?.start();
 shadowDispatcher.start();
 cloudPump?.start(config.cloudRelay.pollIntervalMs || 1500);
@@ -193,6 +234,10 @@ async function stop() {
   try { await lifePlanningDispatcher.stop(); } catch {}
   try { await consolidationWorker.stop(); } catch {}
   try { sessionSummaryWorker?.stop(); await sessionSummaryWorker?.idle(); } catch {}
+  try {
+    experienceInterpretationWorker?.stop();
+    await experienceInterpretationWorker?.idle();
+  } catch {}
   try { shadowDispatcher.stop(); } catch {}
   try { cloudPump?.stop(); } catch {}
   try { await server.close(); } catch {}

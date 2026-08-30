@@ -13,6 +13,7 @@ import { createEntityId, defaultPersonaIdFactory, encodeRoleDirectoryKey } from 
 import { PersonaEvolutionRepository } from './repository.mjs';
 import { ENTITY_TYPES, MEMORY_KINDS, MEMORY_STATUSES, PERSONA_SCHEMA_VERSION, PROPOSAL_OUTCOMES } from './schemas.mjs';
 import {
+  validateAutomaticExperienceInterpretationInput,
   validateChangeProposalInput,
   validateAutomaticSessionSummaryInput,
   validateEntityId,
@@ -55,6 +56,7 @@ export class FilePersonaEvolutionRepository extends PersonaEvolutionRepository {
     this.now = now;
     this.idFactory = idFactory;
     this.sessionSummaryOperations = new Map();
+    this.interpretationOperations = new Map();
   }
 
   #inside(path) {
@@ -307,6 +309,60 @@ export class FilePersonaEvolutionRepository extends PersonaEvolutionRepository {
 
   async listExperienceInterpretations(roleId, options = {}) {
     return this.#list(roleId, ENTITY_TYPES.EXPERIENCE_INTERPRETATION, options);
+  }
+
+  async getExperienceInterpretationBySessionSummary(roleId, sessionSummaryId) {
+    validateRoleId(roleId);
+    if (typeof sessionSummaryId !== 'string' || !/^sum_[A-Za-z0-9_-]+$/.test(sessionSummaryId)) {
+      throw new PersonaValidationError('sessionSummaryId has an invalid identity');
+    }
+    const matches = (await this.listExperienceInterpretations(roleId)).filter(
+      entity => entity.sessionSummaryId === sessionSummaryId
+    );
+    if (matches.length > 1) throw new PersonaDataCorruptionError('duplicate experience interpretations for session summary');
+    return matches[0] || null;
+  }
+
+  async putExperienceInterpretationForSessionSummary(roleId, input) {
+    validateRoleId(roleId);
+    validateAutomaticExperienceInterpretationInput(input);
+    const key = `${roleId}\0${input.sessionSummaryId}`;
+    const before = this.interpretationOperations.get(key) || Promise.resolve();
+    const current = before.catch(() => {}).then(async () => {
+      if (!await this.getSessionSummary(roleId, input.sessionSummaryId)) {
+        throw new PersonaValidationError('sessionSummaryId does not reference this role');
+      }
+      const existing = await this.getExperienceInterpretationBySessionSummary(roleId, input.sessionSummaryId);
+      if (!existing) {
+        const entity = this.#entity(ENTITY_TYPES.EXPERIENCE_INTERPRETATION, roleId, input);
+        validatePersistedEntity(entity, ENTITY_TYPES.EXPERIENCE_INTERPRETATION);
+        await this.#atomicCreate(this.#entityPath(roleId, ENTITY_TYPES.EXPERIENCE_INTERPRETATION, entity.id), entity);
+        return { status: 'created', entity: clone(entity) };
+      }
+      if (!Object.hasOwn(existing, 'inputDigest')) {
+        throw new PersonaDataCorruptionError('legacy interpretation already owns session summary');
+      }
+      if (existing.inputDigest === input.inputDigest) {
+        return { status: 'unchanged', entity: clone(existing) };
+      }
+      const updated = {
+        ...existing,
+        ...clone(input),
+        updatedAt: normalizeNow(this.now),
+        revision: existing.revision + 1
+      };
+      validatePersistedEntity(updated, ENTITY_TYPES.EXPERIENCE_INTERPRETATION);
+      await this.#atomicReplace(
+        this.#entityPath(roleId, ENTITY_TYPES.EXPERIENCE_INTERPRETATION, existing.id),
+        updated
+      );
+      return { status: 'updated', entity: clone(updated) };
+    });
+    const tail = current.finally(() => {
+      if (this.interpretationOperations.get(key) === tail) this.interpretationOperations.delete(key);
+    });
+    this.interpretationOperations.set(key, tail);
+    return current;
   }
 
   async createChangeProposal(roleId, input) {

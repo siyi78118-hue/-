@@ -1,4 +1,5 @@
 import {
+  AUTOMATIC_EXPERIENCE_INTERPRETATION_PAYLOAD_KEYS,
   AUTOMATIC_SESSION_SUMMARY_PAYLOAD_KEYS,
   COMMON_ENTITY_KEYS,
   ENTITY_PAYLOAD_KEYS,
@@ -80,8 +81,8 @@ function isoTimestamp(value, label) {
   return value;
 }
 
-function array(value, label, validateItem, { min = 0 } = {}) {
-  if (!Array.isArray(value) || value.length < min || value.length > MAX_ARRAY_ITEMS) {
+function array(value, label, validateItem, { min = 0, max = MAX_ARRAY_ITEMS } = {}) {
+  if (!Array.isArray(value) || value.length < min || value.length > max) {
     fail(`${label} must be an array with a valid size`);
   }
   value.forEach((item, index) => validateItem(item, `${label}[${index}]`));
@@ -145,6 +146,41 @@ function hypothesis(value, label) {
   exactKeys(value, ['statement', 'confidence'], label);
   string(value.statement, `${label}.statement`);
   confidence(value.confidence, `${label}.confidence`);
+}
+
+function interpretationImpact(value, label = 'impact') {
+  exactKeys(value, ['level', 'rationale'], label);
+  enumValue(value.level, ['none', 'low', 'medium', 'high'], `${label}.level`);
+  string(value.rationale, `${label}.rationale`);
+}
+
+function interpretationNextStage(value, label = 'nextStage') {
+  exactKeys(value, ['recommendProposal', 'rationale'], label);
+  if (typeof value.recommendProposal !== 'boolean') fail(`${label}.recommendProposal must be a boolean`);
+  string(value.rationale, `${label}.rationale`);
+}
+
+function interpretationContext(value, label = 'context') {
+  exactKeys(value, ['summaryRevision', 'summarySourceDigest', 'personalityRevision', 'memoryRefs'], label);
+  positiveInteger(value.summaryRevision, `${label}.summaryRevision`);
+  string(value.summarySourceDigest, `${label}.summarySourceDigest`, { max: 64 });
+  if (!/^[a-f0-9]{64}$/.test(value.summarySourceDigest)) fail(`${label}.summarySourceDigest must be lowercase SHA-256`);
+  if (value.personalityRevision !== null) positiveInteger(value.personalityRevision, `${label}.personalityRevision`);
+  array(value.memoryRefs, `${label}.memoryRefs`, (item, itemLabel) => {
+    exactKeys(item, ['id', 'revision'], itemLabel);
+    identifier(item.id, `${itemLabel}.id`, { prefix: 'mem' });
+    positiveInteger(item.revision, `${itemLabel}.revision`);
+  });
+  if (new Set(value.memoryRefs.map(item => item.id)).size !== value.memoryRefs.length) {
+    fail(`${label}.memoryRefs must be unique`);
+  }
+}
+
+function interpretationGeneration(value, label = 'generation') {
+  exactKeys(value, ['interpreterVersion', 'promptVersion', 'model'], label);
+  string(value.interpreterVersion, `${label}.interpreterVersion`, { max: 128 });
+  string(value.promptVersion, `${label}.promptVersion`, { max: 128 });
+  string(value.model, `${label}.model`, { max: 256 });
 }
 
 function proposedChange(value, label) {
@@ -219,12 +255,29 @@ export function validateAutomaticSessionSummaryInput(input) {
 }
 
 export function validateExperienceInterpretationInput(input) {
+  if (Object.hasOwn(input || {}, 'inputDigest')) return validateAutomaticExperienceInterpretationInput(input);
   exactKeys(input, ENTITY_PAYLOAD_KEYS[ENTITY_TYPES.EXPERIENCE_INTERPRETATION], 'experience interpretation input');
   identifier(input.sessionSummaryId, 'sessionSummaryId', { prefix: 'sum' });
   string(input.meaning, 'meaning');
   string(input.selfImpact, 'selfImpact');
   array(input.hypotheses, 'hypotheses', hypothesis);
   sourceRefs(input.sourceRefs);
+  return input;
+}
+
+export function validateAutomaticExperienceInterpretationInput(input) {
+  exactKeys(input, AUTOMATIC_EXPERIENCE_INTERPRETATION_PAYLOAD_KEYS, 'automatic experience interpretation input');
+  identifier(input.sessionSummaryId, 'sessionSummaryId', { prefix: 'sum' });
+  string(input.meaning, 'meaning');
+  string(input.selfImpact, 'selfImpact');
+  array(input.hypotheses, 'hypotheses', hypothesis, { max: 5 });
+  interpretationImpact(input.impact);
+  interpretationNextStage(input.nextStage);
+  sourceRefs(input.sourceRefs);
+  string(input.inputDigest, 'inputDigest', { max: 64 });
+  if (!/^[a-f0-9]{64}$/.test(input.inputDigest)) fail('inputDigest must be lowercase SHA-256');
+  interpretationContext(input.context);
+  interpretationGeneration(input.generation);
   return input;
 }
 
@@ -275,7 +328,9 @@ export function validateListOptions(options, allowedFilters) {
 function validateCommonEntity(entity, expectedType) {
   const payloadKeys = expectedType === ENTITY_TYPES.SESSION_SUMMARY && Object.hasOwn(entity || {}, 'sourceSessionId')
     ? AUTOMATIC_SESSION_SUMMARY_PAYLOAD_KEYS
-    : ENTITY_PAYLOAD_KEYS[expectedType];
+    : expectedType === ENTITY_TYPES.EXPERIENCE_INTERPRETATION && Object.hasOwn(entity || {}, 'inputDigest')
+      ? AUTOMATIC_EXPERIENCE_INTERPRETATION_PAYLOAD_KEYS
+      : ENTITY_PAYLOAD_KEYS[expectedType];
   if (!payloadKeys) fail('entityType is invalid');
   exactKeys(entity, [...COMMON_ENTITY_KEYS, ...payloadKeys], `${expectedType} entity`);
   validateEntityId(expectedType, entity.id);
@@ -292,7 +347,9 @@ export function validatePersistedEntity(entity, expectedType) {
   validateCommonEntity(entity, expectedType);
   const payloadKeys = expectedType === ENTITY_TYPES.SESSION_SUMMARY && Object.hasOwn(entity, 'sourceSessionId')
     ? AUTOMATIC_SESSION_SUMMARY_PAYLOAD_KEYS
-    : ENTITY_PAYLOAD_KEYS[expectedType];
+    : expectedType === ENTITY_TYPES.EXPERIENCE_INTERPRETATION && Object.hasOwn(entity, 'inputDigest')
+      ? AUTOMATIC_EXPERIENCE_INTERPRETATION_PAYLOAD_KEYS
+      : ENTITY_PAYLOAD_KEYS[expectedType];
   const payload = Object.fromEntries(payloadKeys.map(key => [key, entity[key]]));
   if (expectedType === ENTITY_TYPES.PERSONALITY_STATE) validatePersonalityStateInput(payload);
   if (expectedType === ENTITY_TYPES.MEMORY) validateMemoryInput(payload);

@@ -221,14 +221,25 @@ test('startup recovery and idle sweep finalize persisted closed sessions without
     repository,
     generator: { model: 'fake-model', generate: async () => { generated += 1; return output(); } }
   });
+  const finalizedSummaries = [];
   const worker = new SessionSummaryWorker({
     source, summarizer, roleIds: ['role_a'],
     now: () => Date.parse('2026-08-27T11:00:00.000Z'),
     idleTimeoutMs: 30 * 60_000,
-    sweepIntervalMs: 60_000
+    sweepIntervalMs: 60_000,
+    onSummaryFinalized(event) {
+      finalizedSummaries.push(event);
+      throw new Error('synthetic interpretation scheduling failure');
+    }
   });
   assert.equal((await worker.recover()).created, 1);
+  await worker.idle();
+  assert.equal(finalizedSummaries.length, 1);
+  assert.equal(finalizedSummaries[0].roleId, 'role_a');
+  assert.match(finalizedSummaries[0].summaryId, /^sum_/);
   assert.equal((await worker.sweep()).unchanged, 1);
+  await worker.idle();
+  assert.equal(finalizedSummaries.length, 2);
   assert.equal(generated, 1);
   worker.stop();
 }));

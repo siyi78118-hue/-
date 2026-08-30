@@ -22,11 +22,15 @@ export class SessionSummaryWorker {
     idleTimeoutMs = DEFAULT_SESSION_IDLE_TIMEOUT_MS,
     sweepIntervalMs = DEFAULT_SESSION_SUMMARY_SWEEP_INTERVAL_MS,
     now = () => Date.now(),
-    logger = null
+    logger = null,
+    onSummaryFinalized = null
   } = {}) {
     if (!source?.listAll) throw new Error('session summary source is required');
     if (!summarizer?.finalizeSession) throw new Error('session summarizer is required');
     if (typeof now !== 'function') throw new Error('session summary clock is required');
+    if (onSummaryFinalized !== null && typeof onSummaryFinalized !== 'function') {
+      throw new Error('session summary observer must be a function');
+    }
     this.source = source;
     this.summarizer = summarizer;
     this.roleIds = roleList(roleIds);
@@ -34,6 +38,7 @@ export class SessionSummaryWorker {
     this.sweepIntervalMs = positiveInteger(sweepIntervalMs, 'sweepIntervalMs');
     this.now = now;
     this.logger = logger;
+    this.onSummaryFinalized = onSummaryFinalized;
     this.timer = null;
     this.current = null;
     this.background = new Set();
@@ -111,6 +116,13 @@ export class SessionSummaryWorker {
           try {
             const result = await this.summarizer.finalizeSession(session);
             counts[result.status] += 1;
+            if (this.onSummaryFinalized) {
+              this.observeTask(Promise.resolve().then(() => this.onSummaryFinalized({
+                roleId,
+                summaryId: result.summaryId,
+                status: result.status
+              })));
+            }
           } catch (error) {
             counts.failed += 1;
             this.logger?.({

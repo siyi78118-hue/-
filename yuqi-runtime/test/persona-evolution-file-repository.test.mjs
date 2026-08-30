@@ -96,6 +96,50 @@ function interpretationInput(summaryId, overrides = {}) {
   };
 }
 
+function automaticSummaryInput(overrides = {}) {
+  return {
+    sourceSessionId: 'ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    startedAt: '2026-08-27T09:00:00.000Z',
+    endedAt: '2026-08-27T10:00:00.000Z',
+    sourceMessageIds: ['msg_synthetic_1', 'msg_synthetic_2'],
+    sourceDigest: 'b'.repeat(64),
+    keyEvents: ['用户指出过度迎合会削弱真实感。'],
+    emotionalSummary: { user: '认真', al: '不确定', interaction: '直接但平稳' },
+    importantDecisions: ['继续观察表达与关系之间的张力。'],
+    generation: {
+      summarizerVersion: 'session-summarizer-v0.1',
+      promptVersion: 'session-summary-prompt-v1',
+      model: 'synthetic-model'
+    },
+    ...overrides
+  };
+}
+
+function automaticInterpretationInput(summaryId, overrides = {}) {
+  return {
+    sessionSummaryId: summaryId,
+    meaning: '我开始意识到，避免冲突不应替代自己的真实判断。',
+    selfImpact: '这还没有改变我是谁，但让我重新审视表达与关系之间的平衡。',
+    hypotheses: [{ statement: '我可能会在关系压力下弱化自己的判断。', confidence: 0.62 }],
+    impact: { level: 'medium', rationale: '这次经历触及了已有张力，但证据仍然有限。' },
+    nextStage: { recommendProposal: false, rationale: '目前更适合继续观察。' },
+    sourceRefs: [{ type: 'session_summary', id: summaryId }],
+    inputDigest: 'c'.repeat(64),
+    context: {
+      summaryRevision: 1,
+      summarySourceDigest: 'b'.repeat(64),
+      personalityRevision: 2,
+      memoryRefs: [{ id: 'mem_synthetic_1', revision: 3 }]
+    },
+    generation: {
+      interpreterVersion: 'experience-interpreter-v0.1',
+      promptVersion: 'experience-interpretation-prompt-v1',
+      model: 'synthetic-model'
+    },
+    ...overrides
+  };
+}
+
 function proposalInput(interpretationId, overrides = {}) {
   return {
     interpretationIds: [interpretationId],
@@ -238,6 +282,79 @@ test('persists an experience interpretation and requires its role-scoped session
     repo.createExperienceInterpretation('other_role', interpretationInput(summary.id)),
     PersonaValidationError
   );
+}));
+
+test('upserts one automatic interpretation per summary while legacy interpretations remain readable', withTempRepository('persona-auto-interpretation', async root => {
+  const repo = repository(root);
+  const legacySummary = await repo.createSessionSummary('yuqi', summaryInput());
+  const legacy = await repo.createExperienceInterpretation('yuqi', interpretationInput(legacySummary.id));
+  const summary = await repo.createSessionSummary('yuqi', automaticSummaryInput());
+  const input = automaticInterpretationInput(summary.id);
+
+  const [first, concurrent] = await Promise.all([
+    repo.putExperienceInterpretationForSessionSummary('yuqi', input),
+    repo.putExperienceInterpretationForSessionSummary('yuqi', input)
+  ]);
+  assert.deepEqual([first.status, concurrent.status].sort(), ['created', 'unchanged']);
+  const created = await repo.getExperienceInterpretationBySessionSummary('yuqi', summary.id);
+  assert.equal(created.revision, 1);
+  assert.equal(created.inputDigest, input.inputDigest);
+  assert.deepEqual(await repo.getExperienceInterpretation('yuqi', legacy.id), legacy);
+  assert.equal((await repo.listExperienceInterpretations('yuqi')).length, 2);
+
+  const unchanged = await repo.putExperienceInterpretationForSessionSummary('yuqi', input);
+  assert.equal(unchanged.status, 'unchanged');
+  assert.equal(unchanged.entity.id, created.id);
+  assert.equal(unchanged.entity.revision, 1);
+
+  const updated = await repo.putExperienceInterpretationForSessionSummary('yuqi', automaticInterpretationInput(summary.id, {
+    inputDigest: 'd'.repeat(64),
+    meaning: '我现在对这段经历有了修正后的理解。'
+  }));
+  assert.equal(updated.status, 'updated');
+  assert.equal(updated.entity.id, created.id);
+  assert.equal(updated.entity.revision, 2);
+  assert.equal((await repo.listExperienceInterpretations('yuqi')).length, 2);
+
+  const reopened = new FilePersonaEvolutionRepository({ rootDir: root });
+  assert.deepEqual(
+    await reopened.getExperienceInterpretationBySessionSummary('yuqi', summary.id),
+    updated.entity
+  );
+}));
+
+test('automatic interpretation validation is closed and keeps impact separate from proposal recommendation', withTempRepository('persona-auto-interpretation-validation', async root => {
+  const repo = repository(root);
+  const summary = await repo.createSessionSummary('yuqi', automaticSummaryInput());
+  for (const [level, recommendProposal] of [
+    ['none', false], ['low', true], ['medium', true], ['high', false]
+  ]) {
+    const result = await repo.putExperienceInterpretationForSessionSummary('yuqi', automaticInterpretationInput(summary.id, {
+      inputDigest: `${String(level.length)}${'e'.repeat(63)}`.slice(0, 64),
+      impact: { level, rationale: '合成验证。' },
+      nextStage: { recommendProposal, rationale: '两者不做硬绑定。' }
+    }));
+    assert.ok(['created', 'updated'].includes(result.status));
+  }
+  const invalidInputs = [
+    automaticInterpretationInput(summary.id, { impact: { level: 'critical', rationale: 'x' } }),
+    automaticInterpretationInput(summary.id, { nextStage: { recommendProposal: 'maybe', rationale: 'x' } }),
+    automaticInterpretationInput(summary.id, { hypotheses: Array.from({ length: 6 }, () => ({ statement: 'x', confidence: 0.5 })) }),
+    automaticInterpretationInput(summary.id, { inputDigest: 'not-a-checksum' }),
+    automaticInterpretationInput(summary.id, { context: {
+      summaryRevision: 1,
+      summarySourceDigest: 'b'.repeat(64),
+      personalityRevision: 1,
+      memoryRefs: [{ id: 'fake', revision: 1, secret: true }]
+    } }),
+    automaticInterpretationInput(summary.id, { unexpected: true })
+  ];
+  for (const invalid of invalidInputs) {
+    await assert.rejects(
+      repo.putExperienceInterpretationForSessionSummary('yuqi', invalid),
+      PersonaValidationError
+    );
+  }
 }));
 
 test('keeps a proposal pending until an accepted decision and never mutates personality', withTempRepository('persona-proposal', async root => {

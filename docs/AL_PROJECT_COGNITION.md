@@ -422,9 +422,14 @@ ChatGPT 负责：
 
 # 当前
 
-下一阶段重点：
+Persona Evolution 当前已经具备三个可独立验证的阶段：
 
-1. 继续研究“经历解释器”的最小可验证版本。
-2. 比较 Hermes 与现有 A.L. 的实际复用价值。
-3. 确定人格层、记忆层和运行框架之间应该如何解耦。
-4. 暂不急于扩大主动性、实时语音、虚拟形象等表现层功能。
+1. Stage 1：统一持久化 Personality State、Memory、Session Summary、Experience Interpretation 与 Change Proposal。
+2. Stage 2：把已结束的可见会话生成结构化 Session Summary；失败不阻塞聊天。
+3. Stage 3：以 Session Summary、当前 Personality State 与少量相关 active Memory 生成第一人称 Experience Interpretation。
+
+Stage 3 只保存“这段经历对我意味着什么”的解释、影响等级和是否建议进入下一阶段评估。它不会修改 Personality State、创建 Memory、创建 Change Proposal 或重写 Session Summary；同一摘要幂等，摘要合法修订后更新原解释，支持启动恢复。生产配置默认关闭，需在后续质量观察确认后再显式启用。
+
+真实模型的四组 synthetic smoke 已覆盖普通闲聊、自我冲突、用户单方面贴标签与长期重复模式：普通闲聊没有被强造成长；单方面标签没有被当作人格事实；重复模式能够引用冲突证据并保留不确定性。Stage 4 尚未设计或实现，当前不得自动修改人格。
+
+下一阶段研究重点仍包括比较 Hermes 与现有 A.L. 的复用价值，以及确定人格层、记忆层和运行框架的长期解耦方式；暂不扩大主动性、实时语音或虚拟形象等表现层功能。

@@ -45,6 +45,11 @@ export const AUTOMATIC_SESSION_SUMMARY_PAYLOAD_KEYS = Object.freeze([
   'keyEvents', 'emotionalSummary', 'importantDecisions', 'generation'
 ]);
 
+export const AUTOMATIC_EXPERIENCE_INTERPRETATION_PAYLOAD_KEYS = Object.freeze([
+  'sessionSummaryId', 'meaning', 'selfImpact', 'hypotheses', 'impact', 'nextStage',
+  'sourceRefs', 'inputDigest', 'context', 'generation'
+]);
+
 export const ENTITY_PAYLOAD_KEYS = Object.freeze({
   personality_state: ['selfDescription', 'tendencies', 'tensions'],
   memory: ['kind', 'content', 'confidence', 'status', 'sourceRefs', 'supersedesId', 'supersededById'],
